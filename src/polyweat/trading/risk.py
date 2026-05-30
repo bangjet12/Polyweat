@@ -1,0 +1,63 @@
+"""Pre-trade risk gates that complement the decision engine.
+
+These checks are applied a second time *just before* an order is sent,
+because state (open positions, daily PnL, ...) may have moved since
+``decision.make_decision`` ran.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from polyweat.config import Config
+from polyweat.db import Database
+from polyweat.logger import get_logger
+from polyweat.models import TradeDecision
+
+log = get_logger("risk")
+
+
+@dataclass
+class RiskCheck:
+    ok: bool
+    reason: str = ""
+
+
+def pre_trade_checks(td: TradeDecision, db: Database, cfg: Config) -> RiskCheck:
+    """Final go/no-go gate before the trader places an order."""
+    if td.decision not in ("ENTER", "PASSIVE"):
+        return RiskCheck(False, f"decision_not_actionable_{td.decision}")
+
+    if td.token_id is None or td.proposed_price is None:
+        return RiskCheck(False, "missing_token_or_price")
+
+    if td.proposed_size_usd is None or td.proposed_size_usd <= 0:
+        return RiskCheck(False, "invalid_size")
+
+    # Re-check size cap (defense-in-depth).
+    if td.proposed_size_usd > cfg.max_position_per_market_usd:
+        return RiskCheck(
+            False,
+            f"size_above_cap_{td.proposed_size_usd}>{cfg.max_position_per_market_usd}",
+        )
+
+    # Re-check open position count.
+    if db.has_open_position(td.market_id):
+        return RiskCheck(False, "duplicate_market_position")
+    if db.count_open_positions() >= cfg.max_open_positions:
+        return RiskCheck(False, "max_open_positions_reached")
+
+    # Re-check daily loss cap.
+    if db.daily_loss_today() >= cfg.max_daily_loss_usd:
+        return RiskCheck(False, "daily_loss_limit_hit")
+
+    # Price band re-check.
+    p = float(td.proposed_price)
+    if td.decision == "ENTER":
+        if p < cfg.min_entry_price or p > cfg.max_entry_price:
+            return RiskCheck(False, f"enter_price_out_of_band_{p}")
+    elif td.decision == "PASSIVE":
+        if p < cfg.passive_order_min_price or p > cfg.passive_order_max_price:
+            return RiskCheck(False, f"passive_price_out_of_band_{p}")
+
+    return RiskCheck(True)

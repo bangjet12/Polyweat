@@ -1,0 +1,7 @@
+requests>=2.31.0
+python-dotenv>=1.0.1
+python-dateutil>=2.9.0
+tzdata>=2024.1
+# Optional: only required for live trading on Polymarket CLOB.
+# Safe to skip if running purely in DRY_RUN mode.
+py-clob-client>=0.17.0; python_version >= "3.9"

@@ -1,0 +1,39 @@
+[Unit]
+Description=Polyweat - Polymarket weather/temperature trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polyweat
+Group=polyweat
+WorkingDirectory=/opt/polyweat
+EnvironmentFile=-/opt/polyweat/.env
+ExecStart=/opt/polyweat/.venv/bin/polyweat --env /opt/polyweat/.env run
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/polyweat/data /opt/polyweat/logs
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polyweat
+
+[Install]
+WantedBy=multi-user.target
