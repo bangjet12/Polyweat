@@ -113,6 +113,7 @@ class DryRunTrader(BaseTrader):
             size_shares=size_shares,
             status="open",
         )
+        self.db.bump_entries_count()
         log.info(
             "[DRY] ENTER %s %s @ %.4f size=$%.2f (%s)",
             td.outcome, td.market_id, price, size_usd, td.title[:60],
@@ -142,7 +143,7 @@ class DryRunTrader(BaseTrader):
         return po_id
 
     def reconcile_passive_orders(self) -> None:
-        """Mark any expired passive order as 'expired'. (No real fills in dry mode.)"""
+        """Cancel passive orders whose timer has elapsed."""
         now = datetime.now(timezone.utc)
         for row in self.db.list_open_passive_orders():
             try:
@@ -156,6 +157,16 @@ class DryRunTrader(BaseTrader):
                     int(row["id"]), "expired", "DRY_RUN expiration"
                 )
                 log.info("[DRY] passive order %s expired", row["id"])
+
+    def reconcile_inflight_order(self, row) -> None:
+        """No-op for dry-run trader (no real exchange to query)."""
+        # In DRY_RUN there should be no rows where dry_run=0 anyway, but if
+        # someone switches modes mid-DB, just close them with a clear note.
+        self.db.update_order_status(
+            int(row["id"]),
+            status="cancelled",
+            note="dry-run startup: cancelling stale live order row",
+        )
 
 
 # ---------------------------------------------------------------------
@@ -273,6 +284,49 @@ class LiveTrader(BaseTrader):
             ).upper()
         return status
 
+    def _exchange_filled_size(
+        self, ext_id: str
+    ) -> "tuple[Optional[float], Optional[float]]":
+        """Return (filled_size_usd, filled_avg_price) or (None, None)."""
+        if not ext_id:
+            return (None, None)
+        try:
+            data = self._client.get_order(ext_id)  # type: ignore[attr-defined]
+        except Exception as exc:
+            log.warning("get_order(%s) for fill size failed: %s", ext_id, exc)
+            return (None, None)
+        if not isinstance(data, dict):
+            return (None, None)
+
+        # Polymarket fills are reported in a few possible field shapes; we
+        # try the common ones in order. All values normalised to USD notional.
+        size_shares: Optional[float] = None
+        for k in ("size_matched", "filled_size", "filled_amount",
+                  "matchedAmount", "filled"):
+            v = data.get(k)
+            if v is None:
+                continue
+            try:
+                size_shares = float(v)
+                break
+            except (TypeError, ValueError):
+                continue
+
+        avg_price: Optional[float] = None
+        for k in ("avg_price", "average_price", "price", "matchedPrice"):
+            v = data.get(k)
+            if v is None:
+                continue
+            try:
+                avg_price = float(v)
+                break
+            except (TypeError, ValueError):
+                continue
+
+        if size_shares is None or avg_price is None or avg_price <= 0:
+            return (None, None)
+        return (size_shares * avg_price, avg_price)
+
     def _cancel(self, ext_id: str) -> bool:
         if not ext_id:
             return False
@@ -327,6 +381,7 @@ class LiveTrader(BaseTrader):
                 size_shares=size_shares,
                 status="open",
             )
+            self.db.bump_entries_count()
             log.info(
                 "[LIVE] ENTER %s %s @ %.4f size=$%.2f order=%s",
                 td.outcome, td.market_id, price, size_usd, ext_id,
@@ -363,12 +418,12 @@ class LiveTrader(BaseTrader):
 
         ext_id = self._place_limit_buy(td.token_id or "", price, size_shares)
         if ext_id:
-            # Persist the external id so reconciliation can find it.
-            with self.db._conn() as c:  # type: ignore[attr-defined]
-                c.execute(
-                    "UPDATE passive_orders SET external_order_id = ?, note = ? WHERE id = ?",
-                    (ext_id, "LIVE passive submitted", po_pk),
-                )
+            # Persist the external id so reconciliation can find it. Use
+            # the public Database API (no reaching into _conn).
+            self.db.set_passive_order_external_id(
+                po_pk, ext_id, "LIVE passive submitted",
+            )
+            self.db.bump_entries_count()
             log.info(
                 "[LIVE] PASSIVE %s %s @ %.4f expires_in=%ds order=%s",
                 td.outcome, td.market_id, price,
@@ -401,8 +456,11 @@ class LiveTrader(BaseTrader):
 
             # 1) Filled while we were sleeping?
             if status in _FILLED_STATUSES:
-                price = float(row["price"] or 0.0)
-                size_usd = float(row["size_usd"] or 0.0)
+                # Try to read the actual filled size from the exchange. If
+                # we can't, fall back to the local size_usd, but log it.
+                filled_size_usd, filled_price = self._exchange_filled_size(ext_id)
+                price = filled_price if filled_price else float(row["price"] or 0.0)
+                size_usd = filled_size_usd if filled_size_usd is not None else float(row["size_usd"] or 0.0)
                 shares = size_usd / max(price, 1e-9)
                 self.db.upsert_position(
                     market_id=row["market_id"],
@@ -415,11 +473,14 @@ class LiveTrader(BaseTrader):
                     status="open",
                 )
                 self.db.update_passive_order_status(
-                    int(row["id"]), "filled", "passive filled (reconciled)"
+                    int(row["id"]),
+                    "filled",
+                    f"passive filled (reconciled, size=${size_usd:.4f})",
                 )
                 log.info(
-                    "[LIVE] passive %s FILLED -> position created (price=%.4f)",
-                    row["id"], price,
+                    "[LIVE] passive %s FILLED -> position created "
+                    "(price=%.4f, size=$%.4f)",
+                    row["id"], price, size_usd,
                 )
                 continue
 
@@ -461,65 +522,179 @@ class LiveTrader(BaseTrader):
         """
         return _reconcile_positions(self.db, gamma)
 
+    def reconcile_inflight_order(self, row) -> None:
+        """Recover a single ``orders`` row left in pending/submitted from
+        a previous process. Called once on startup.
+
+        Logic:
+          * If the row has no ``external_order_id`` (we crashed before the
+            ack), there is no way to know whether the exchange got the
+            order. Mark it ``rejected`` and let the operator review the
+            log. We do NOT create a position from a row without an id.
+          * If we have an external id, ask the exchange. FILLED / MATCHED
+            -> create a position. CANCELLED / REJECTED -> mark rejected.
+            OPEN / PENDING -> leave it.
+        """
+        order_pk = int(row["id"])
+        ext_id = row["external_order_id"] or ""
+        if not ext_id:
+            log.warning(
+                "[LIVE] startup: order pk=%d on %s has no external id; "
+                "marking rejected (no way to reconcile).",
+                order_pk, row["market_id"],
+            )
+            self.db.update_order_status(
+                order_pk, status="rejected",
+                note="startup: dropped (no external_order_id; "
+                     "exchange status unknown)",
+            )
+            return
+
+        status = self._exchange_order_status(ext_id)
+        if status in _FILLED_STATUSES:
+            filled_size_usd, filled_price = self._exchange_filled_size(ext_id)
+            price = filled_price or float(row["price"] or 0.0)
+            size_usd = filled_size_usd if filled_size_usd is not None else float(row["size_usd"] or 0.0)
+            shares = size_usd / max(price, 1e-9)
+            self.db.upsert_position(
+                market_id=row["market_id"],
+                token_id=row["token_id"],
+                title=row["market_id"],
+                outcome=row["outcome"] or "YES",
+                entry_price=price,
+                size_usd=size_usd,
+                size_shares=shares,
+                status="open",
+            )
+            self.db.update_order_status(
+                order_pk, status="filled",
+                note=f"startup: reconciled FILLED size=${size_usd:.4f}",
+            )
+            log.info(
+                "[LIVE] startup: order %s FILLED -> position created "
+                "(price=%.4f size=$%.4f)",
+                ext_id, price, size_usd,
+            )
+            return
+        if status in _CANCELLED_STATUSES:
+            self.db.update_order_status(
+                order_pk, status="cancelled",
+                note=f"startup: exchange status={status}",
+            )
+            log.info("[LIVE] startup: order %s -> cancelled (%s)", ext_id, status)
+            return
+        # OPEN / PENDING / unknown - leave it. The next scan will retry
+        # via reconcile_passive_orders for passives, or stay pending.
+        log.info(
+            "[LIVE] startup: order %s still %s; leaving as %s",
+            ext_id, status or "unknown", row["status"],
+        )
+
 
 def _reconcile_positions(db: Database, gamma) -> int:
     """Shared closer used by both live and dry-run traders.
 
-    For each open position, check the Gamma market: if it's closed/resolved
+    For each open position, check the Gamma market: if it's *fully resolved*
     we compute realized PnL and mark the position closed. Updates daily
     stats so MAX_DAILY_LOSS_USD actually engages.
+
+    Resolution rules (deliberately conservative):
+      * We require ``closed=True`` AND a clearly identified winner price
+        (>= 0.99 on one side and <= 0.01 on the other). A market that is
+        merely ``closed`` but whose prices are still in flight is left
+        alone for next cycle.
+      * If the market is closed for many days but never resolves cleanly
+        (refund/void/dispute), we still leave it open so an operator can
+        close it manually instead of silently writing $0 PnL.
+      * Mismatched ``outcomes``/``prices`` arrays are treated as
+        unresolved, not as a loss.
+
+    Per-position errors are caught so one malformed market can't starve
+    the rest of the queue.
     """
     closed = 0
     for row in db.list_open_positions():
-        market_id = row["market_id"]
-        market = gamma.fetch_market(market_id)
-        if not market:
-            continue
-        if not (market.get("closed") or market.get("resolved")):
-            continue
-
-        nm = gamma.normalize(market)
-        outcomes = nm.get("outcomes") or []
-        prices = nm.get("prices") or []
-
-        winner_idx: Optional[int] = None
-        for i, p in enumerate(prices):
-            try:
-                if p is not None and float(p) >= 0.99:
-                    winner_idx = i
-                    break
-            except (TypeError, ValueError):
-                continue
-
-        my_outcome = (row["outcome"] or "").upper()
-        size_usd = float(row["size_usd"] or 0.0)
-        entry_price = float(row["entry_price"] or 0.0)
-
-        if winner_idx is None:
-            # Resolved but no clear winner (refund / void). Mark closed at 0.
-            db.close_position(market_id, 0.0)
-            closed += 1
-            log.info(
-                "[reconcile] %s closed - no clear winner, pnl=$0.00",
-                market_id,
+        try:
+            closed += _reconcile_one_position(db, gamma, row)
+        except Exception as exc:  # noqa: BLE001 - log + continue
+            log.exception(
+                "[reconcile] %s: error during reconciliation: %s",
+                row["market_id"], exc,
             )
             continue
-
-        winner = (outcomes[winner_idx] or "").strip().upper() if winner_idx < len(outcomes) else ""
-        if winner == my_outcome:
-            # Win: each $1 of cost returns $1 in shares which pay out $1.
-            # Profit per dollar invested = (1 - entry_price) / entry_price.
-            shares = size_usd / max(entry_price, 1e-9)
-            pnl = shares * 1.0 - size_usd  # gross before fees
-        else:
-            pnl = -size_usd
-        db.close_position(market_id, round(pnl, 4))
-        closed += 1
-        log.info(
-            "[reconcile] %s closed (%s won, our %s) pnl=%+.2f",
-            market_id, winner, my_outcome, pnl,
-        )
     return closed
+
+
+def _reconcile_one_position(db: Database, gamma, row) -> int:
+    market_id = row["market_id"]
+    market = gamma.fetch_market(market_id)
+    if not market:
+        return 0
+    if not market.get("closed"):
+        # Not even closed yet - give it more time.
+        return 0
+
+    nm = gamma.normalize(market)
+    outcomes = nm.get("outcomes") or []
+    prices = nm.get("prices") or []
+
+    # Identify a winner (>=0.99) AND a loser (<=0.01) on the opposite side.
+    # Only this combination indicates a clean settlement.
+    if len(outcomes) != len(prices) or not outcomes:
+        log.warning(
+            "[reconcile] %s closed but outcomes/prices mismatch (%d vs %d) - "
+            "leaving open for manual review",
+            market_id, len(outcomes), len(prices),
+        )
+        return 0
+
+    winner_idx = None
+    loser_idx = None
+    for i, p in enumerate(prices):
+        try:
+            if p is None:
+                continue
+            pf = float(p)
+        except (TypeError, ValueError):
+            continue
+        if pf >= 0.99 and winner_idx is None:
+            winner_idx = i
+        elif pf <= 0.01 and loser_idx is None:
+            loser_idx = i
+
+    if winner_idx is None or loser_idx is None or winner_idx == loser_idx:
+        log.info(
+            "[reconcile] %s closed but no clean winner yet (prices=%s) - "
+            "leaving open for next cycle",
+            market_id, prices,
+        )
+        return 0
+
+    my_outcome = (row["outcome"] or "").upper()
+    size_usd = float(row["size_usd"] or 0.0)
+    entry_price = float(row["entry_price"] or 0.0)
+    winner = (outcomes[winner_idx] or "").strip().upper()
+
+    if not winner:
+        log.warning(
+            "[reconcile] %s has empty winner outcome label - leaving open",
+            market_id,
+        )
+        return 0
+
+    if winner == my_outcome:
+        # PnL = shares * 1.0 - cost = (size_usd / entry_price) - size_usd
+        # which equals size_usd * (1 / entry - 1).
+        shares = size_usd / max(entry_price, 1e-9)
+        pnl = shares * 1.0 - size_usd  # gross before exchange fees
+    else:
+        pnl = -size_usd
+    db.close_position(market_id, round(pnl, 4))
+    log.info(
+        "[reconcile] %s closed (%s won, our %s) pnl=%+.4f",
+        market_id, winner, my_outcome, pnl,
+    )
+    return 1
 
 
 # ---------------------------------------------------------------------

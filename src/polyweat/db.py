@@ -367,9 +367,18 @@ class Database:
                    )""",
                 d,
             )
-        # bump daily counters
-        self._bump_daily(decisions=1, entries=1 if d.get("decision") == "ENTER" else 0,
-                        skips=1 if d.get("decision") == "SKIP" else 0)
+        # Bump only "decisions" and "skips" here. The "entries" counter is
+        # bumped by the trader AFTER the order is actually accepted by the
+        # exchange, so a decision rejected at the risk gate doesn't inflate
+        # stats.
+        self._bump_daily(
+            decisions=1,
+            skips=1 if d.get("decision") == "SKIP" else 0,
+        )
+
+    def bump_entries_count(self) -> None:
+        """Called by the trader after a real order is accepted by the exchange."""
+        self._bump_daily(entries=1)
 
     def list_decisions(self, limit: int = 50) -> List[sqlite3.Row]:
         with self._conn() as c:
@@ -431,6 +440,69 @@ class Database:
                    SET status = ?, closed_at = ?, note = COALESCE(NULLIF(?,''), note)
                    WHERE id = ?""",
                 (status, _now_iso(), note, order_pk),
+            )
+
+    def set_passive_order_external_id(
+        self, order_pk: int, external_order_id: str, note: str = ""
+    ) -> None:
+        """Persist the exchange-side id on a passive_orders row.
+
+        Public wrapper so the trader doesn't reach into ``db._conn()``
+        directly. Critical because if a process crash happens between
+        ``_place_limit_buy`` returning and this call, the external id
+        would be lost forever otherwise.
+        """
+        with self._conn() as c:
+            c.execute(
+                """UPDATE passive_orders
+                   SET external_order_id = ?,
+                       note = COALESCE(NULLIF(?,''), note)
+                   WHERE id = ?""",
+                (external_order_id, note, order_pk),
+            )
+
+    def update_passive_order_size(
+        self, order_pk: int, size_usd: float, note: str = ""
+    ) -> None:
+        """Update the size of a passive order to reflect a partial fill."""
+        with self._conn() as c:
+            c.execute(
+                """UPDATE passive_orders
+                   SET size_usd = ?,
+                       note = COALESCE(NULLIF(?,''), note)
+                   WHERE id = ?""",
+                (size_usd, note, order_pk),
+            )
+
+    def has_inflight_order(self, market_id: str) -> bool:
+        """Return True if there's a pending/submitted live order for ``market_id``.
+
+        Used by ``pre_trade_checks`` so a process restart in the middle of
+        a live submit can't lead to a duplicate order: the breadcrumb row
+        in ``orders`` blocks a re-entry until startup reconciliation
+        clears it (or marks it cancelled/filled).
+        """
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT 1 FROM orders
+                   WHERE market_id = ?
+                     AND dry_run = 0
+                     AND status IN ('pending', 'submitted')
+                   LIMIT 1""",
+                (market_id,),
+            ).fetchone()
+            return row is not None
+
+    def list_inflight_orders(self) -> List[sqlite3.Row]:
+        """Return every live (non dry-run) order still pending/submitted."""
+        with self._conn() as c:
+            return list(
+                c.execute(
+                    """SELECT * FROM orders
+                       WHERE dry_run = 0
+                         AND status IN ('pending', 'submitted')
+                       ORDER BY id ASC"""
+                )
             )
 
     # ----- orders -----
@@ -644,6 +716,7 @@ class Database:
                 ("scanned_markets", "seen_at"),
                 ("forecasts", "fetched_at"),
                 ("rejected_markets", "created_at"),
+                ("decisions", "timestamp"),
             ):
                 cur = c.execute(
                     f"DELETE FROM {table} WHERE {ts_col} < ?", (cutoff,)

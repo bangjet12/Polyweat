@@ -50,13 +50,15 @@ def make_decision(
     *,
     has_open_position: bool,
     open_positions_count: int,
+    open_passive_count: int,
     daily_loss_so_far_usd: float,
-    open_passive_count: int = 0,
 ) -> TradeDecision:
     """Return a TradeDecision for one market.
 
-    ``open_passive_count`` is included so that a stack of passive limit
-    orders can't sneak past the MAX_OPEN_POSITIONS cap if they all fill.
+    ``open_passive_count`` is REQUIRED (not optional) so a regression in
+    the runner that drops the kwarg surfaces immediately. A stack of
+    pending passive limit orders must count toward MAX_OPEN_POSITIONS in
+    case they all fill.
     """
     now = datetime.now(timezone.utc)
     hours_to_res = _hours_until(pm.end_time)
@@ -218,10 +220,10 @@ def make_decision(
     # this is a long-shot bet; default-disabled.
     if ask < cfg.min_entry_price:
         if cfg.allow_longshot:
-            # Operator opted in: enter (still capped by all earlier gates).
             base.decision = "ENTER"
             base.proposed_price = ask
             base.proposed_size_usd = cfg.max_position_per_market_usd
+            base.is_longshot = True
             return base
         base.skip_reason = f"price_below_min_entry_{ask:.4f}"
         return base

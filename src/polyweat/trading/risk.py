@@ -57,10 +57,21 @@ def pre_trade_checks(td: TradeDecision, db: Database, cfg: Config) -> RiskCheck:
     # Price band re-check.
     p = float(td.proposed_price)
     if td.decision == "ENTER":
-        if p < cfg.min_entry_price or p > cfg.max_entry_price:
+        if td.is_longshot:
+            # Long-shot opt-in (ALLOW_LONGSHOT=true): require 0 < p < min_entry.
+            if p <= 0 or p >= cfg.min_entry_price:
+                return RiskCheck(False, f"longshot_price_out_of_band_{p}")
+        elif p < cfg.min_entry_price or p > cfg.max_entry_price:
             return RiskCheck(False, f"enter_price_out_of_band_{p}")
     elif td.decision == "PASSIVE":
         if p < cfg.passive_order_min_price or p > cfg.passive_order_max_price:
             return RiskCheck(False, f"passive_price_out_of_band_{p}")
+
+    # Defense-in-depth: refuse if there is already an open ``orders`` row
+    # for this market - that means a previous live submit is still
+    # in-flight (or got stuck). Without this, a process restart in the
+    # middle of a live submit could let a duplicate order slip through.
+    if db.has_inflight_order(td.market_id):
+        return RiskCheck(False, "inflight_order_exists")
 
     return RiskCheck(True)

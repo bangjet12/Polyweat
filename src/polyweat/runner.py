@@ -45,6 +45,56 @@ class Runner:
         # Per-cycle forecast cache: { (lat,lon, target_day_iso): WeatherForecast }
         self._fc_cache: Dict[Tuple[float, float, str], WeatherForecast] = {}
 
+        # Startup reconciliation: any live `pending`/`submitted` order from
+        # a previous process must be resolved before we accept new entries.
+        # Also reconcile any positions that resolved while we were stopped.
+        try:
+            self._startup_reconcile()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("startup reconciliation failed: %s", exc)
+
+    def _startup_reconcile(self) -> None:
+        """Run on Runner construction to recover from a prior crash.
+
+        1. Reconcile already-resolved positions (mirrors the per-cycle step,
+           but covers the case where the bot was stopped for hours/days).
+        2. Sweep ``orders`` rows still marked ``pending``/``submitted`` and
+           ask the live trader to confirm them. Anything filled becomes a
+           position; anything still open at the exchange is left alone;
+           anything cancelled/rejected at the exchange is closed locally.
+        3. Sweep open passive orders the same way - if the bot was offline
+           when one filled, materialize the position now.
+        """
+        from polyweat.trading.trader import LiveTrader
+
+        # 1) close resolved positions
+        try:
+            n = reconcile_positions(self.db, self.gamma)
+            if n:
+                log.info("startup reconciliation: closed %d resolved positions", n)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("startup position reconciliation failed: %s", exc)
+
+        # 2 + 3) only meaningful in LIVE mode
+        if not isinstance(self.trader, LiveTrader):
+            return
+        try:
+            self.trader.reconcile_passive_orders()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("startup passive reconciliation failed: %s", exc)
+
+        # Sweep stale ``orders`` rows. Only LiveTrader has the exchange
+        # client; it knows how to look them up.
+        inflight = self.db.list_inflight_orders()
+        if inflight:
+            log.warning(
+                "startup: %d in-flight live orders carried over from a "
+                "previous process; reconciling...",
+                len(inflight),
+            )
+            for row in inflight:
+                self.trader.reconcile_inflight_order(row)
+
     # ------------------------------------------------------------------
     # Forecast cache (per cycle)
     # ------------------------------------------------------------------

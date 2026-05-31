@@ -177,6 +177,7 @@ def test_decision_engine_happy_path():
     td = make_decision(
         pm, fc, book, None, cfg,
         has_open_position=False, open_positions_count=0,
+        open_passive_count=0,
         daily_loss_so_far_usd=0.0,
     )
     assert td.decision == "ENTER", f"expected ENTER got {td.decision} ({td.skip_reason})"
@@ -184,21 +185,21 @@ def test_decision_engine_happy_path():
     assert td.proposed_price == 0.97
     _ok(f"decision: ENTER YES @ {td.proposed_price} prob={td.bot_probability}")
 
-    # ask too high -> PASSIVE
     book2 = _build_book(0.99, 0.985)
     td2 = make_decision(
         pm, fc, book2, None, cfg,
         has_open_position=False, open_positions_count=0,
+        open_passive_count=0,
         daily_loss_so_far_usd=0.0,
     )
     assert td2.decision == "PASSIVE", f"expected PASSIVE got {td2.decision}"
     assert cfg.passive_order_min_price <= td2.proposed_price <= cfg.passive_order_max_price
     _ok(f"decision: PASSIVE @ {td2.proposed_price}")
 
-    # forecast right at threshold -> SKIP
     td3 = make_decision(
         pm, _build_fc(27.5), book, None, cfg,
         has_open_position=False, open_positions_count=0,
+        open_passive_count=0,
         daily_loss_so_far_usd=0.0,
     )
     assert td3.decision == "SKIP"
@@ -291,6 +292,7 @@ def test_decision_skips_range():
     td = make_decision(
         pm, fc, book, None, cfg,
         has_open_position=False, open_positions_count=0,
+        open_passive_count=0,
         daily_loss_so_far_usd=0.0,
     )
     assert td.decision == "SKIP" and td.skip_reason == "range_market_skipped"
@@ -328,21 +330,18 @@ def test_decision_f_distance_gate():
     cfg = load_config()
     pm = _build_pm_yes(threshold_c=26.667, threshold_f=80.0)
     book = _build_book(0.97, 0.96)
-
-    # Comfortable distance: forecast 31C vs 26.667C threshold = 4.33C / 7.8F
-    # -> passes both gates -> ENTER
     td = make_decision(
         pm, _build_fc(31.0), book, None, cfg,
         has_open_position=False, open_positions_count=0,
+        open_passive_count=0,
         daily_loss_so_far_usd=0.0,
     )
     assert td.decision == "ENTER", f"expected ENTER got {td.decision} {td.skip_reason}"
 
-    # Tight distance: forecast 28.0C vs 26.667C threshold = 1.33C / 2.4F
-    # -> fails C gate first (since 1.33 < 2.0)
     td2 = make_decision(
         pm, _build_fc(28.0), book, None, cfg,
         has_open_position=False, open_positions_count=0,
+        open_passive_count=0,
         daily_loss_so_far_usd=0.0,
     )
     assert td2.decision == "SKIP"
@@ -357,34 +356,34 @@ def test_decision_skip_reasons_complete():
 
     cfg = load_config()
 
-    # missing orderbook
     td = make_decision(
         _build_pm_yes(), _build_fc(31.0), None, None, cfg,
         has_open_position=False, open_positions_count=0,
+        open_passive_count=0,
         daily_loss_so_far_usd=0.0,
     )
     assert td.decision == "SKIP" and td.skip_reason == "no_orderbook"
 
-    # daily loss limit hit
     td2 = make_decision(
         _build_pm_yes(), _build_fc(31.0), _build_book(0.97, 0.96), None, cfg,
         has_open_position=False, open_positions_count=0,
+        open_passive_count=0,
         daily_loss_so_far_usd=cfg.max_daily_loss_usd,
     )
     assert td2.decision == "SKIP" and "daily_loss_limit_hit" in (td2.skip_reason or "")
 
-    # already have position
     td3 = make_decision(
         _build_pm_yes(), _build_fc(31.0), _build_book(0.97, 0.96), None, cfg,
         has_open_position=True, open_positions_count=1,
+        open_passive_count=0,
         daily_loss_so_far_usd=0.0,
     )
     assert td3.decision == "SKIP" and td3.skip_reason == "already_have_position_in_market"
 
-    # spread too wide
     td4 = make_decision(
         _build_pm_yes(), _build_fc(31.0), _build_book(0.99, 0.95), None, cfg,
         has_open_position=False, open_positions_count=0,
+        open_passive_count=0,
         daily_loss_so_far_usd=0.0,
     )
     assert td4.decision == "SKIP" and "spread_too_wide" in (td4.skip_reason or "")
@@ -452,6 +451,302 @@ def test_threshold_picker_proximity():
 
 
 # =====================================================================
+# v2 regression tests (post-second-pass review)
+# =====================================================================
+
+def test_v2c1_longshot_flow():
+    """V2-C1: when ALLOW_LONGSHOT=true, decision flags is_longshot AND
+    pre_trade_checks accepts the lower price band."""
+    from polyweat.config import load_config
+    from polyweat.db import Database
+    from polyweat.strategy.decision import make_decision
+    from polyweat.trading.risk import pre_trade_checks
+
+    cfg = load_config()
+    cfg.allow_longshot = True
+
+    pm = _build_pm_yes()
+    fc = _build_fc(31.0)
+    # Tight spread around 0.40 so spread/liquidity gates pass.
+    book = _build_book(best_ask=0.40, best_bid=0.396, liquidity=600.0)
+    td = make_decision(
+        pm, fc, book, None, cfg,
+        has_open_position=False, open_positions_count=0,
+        open_passive_count=0,
+        daily_loss_so_far_usd=0.0,
+    )
+    assert td.decision == "ENTER", f"got {td.decision} ({td.skip_reason})"
+    assert td.is_longshot is True
+    assert td.proposed_price == 0.40
+
+    # And the post-decision risk gate must accept it.
+    with tempfile.TemporaryDirectory() as tdir:
+        db = Database(Path(tdir) / "test.db")
+        chk = pre_trade_checks(td, db, cfg)
+        assert chk.ok, f"longshot rejected: {chk.reason}"
+    _ok("V2-C1: ALLOW_LONGSHOT=true -> decision ENTER + risk gate accepts")
+
+
+def test_v2c2_inflight_blocks_duplicate():
+    """V2-C2: a leftover live `submitted` order blocks a re-entry on the
+    same market."""
+    from polyweat.config import load_config
+    from polyweat.db import Database
+    from polyweat.models import TradeDecision
+    from polyweat.trading.risk import pre_trade_checks
+
+    cfg = load_config()
+    with tempfile.TemporaryDirectory() as td_:
+        db = Database(Path(td_) / "test.db")
+        # Leave a stale live order behind (as if a prior process crashed)
+        db.insert_order(
+            market_id="m-dup", token_id="tok", outcome="YES",
+            side="BUY", order_type="LIMIT",
+            price=0.97, size_usd=1.0, size_shares=1.03,
+            status="submitted", dry_run=False,
+            external_order_id="ext-123", note="legacy",
+        )
+        td = TradeDecision(
+            market_id="m-dup", title="t", city=None, target_date=None,
+            market_kind="highest_gte", threshold_c=None, threshold_f=None,
+            outcome="YES", forecast_value_c=None, temp_distance_c=None,
+            bot_probability=None, confidence_score=None, market_price=None,
+            spread_percent=None, liquidity_usd=None,
+            decision="ENTER", skip_reason=None,
+            timestamp=datetime.now(timezone.utc),
+            proposed_price=0.97, proposed_size_usd=1.0, token_id="tok",
+        )
+        chk = pre_trade_checks(td, db, cfg)
+        assert not chk.ok
+        assert chk.reason == "inflight_order_exists"
+    _ok("V2-C2: inflight live order blocks duplicate via pre_trade_checks")
+
+
+def test_v2c3_premature_close_skipped():
+    """V2-C3: a market with closed=True but no clean winner is NOT
+    closed locally; the position stays open."""
+    from polyweat.db import Database
+    from polyweat.trading.trader import _reconcile_positions
+
+    class _FakeGamma:
+        # closed=True but prices are still in flight (0.6/0.4 == not settled)
+        def fetch_market(self, _mid):
+            return {"closed": True}
+
+        @staticmethod
+        def normalize(_raw):
+            return {
+                "outcomes": ["Yes", "No"],
+                "prices": [0.6, 0.4],
+            }
+
+    with tempfile.TemporaryDirectory() as td_:
+        db = Database(Path(td_) / "test.db")
+        db.upsert_position("m1", "t1", "Title", "YES", 0.97, 1.0, 1.03, "open")
+        n = _reconcile_positions(db, _FakeGamma())
+        assert n == 0, "should leave the position open until prices settle"
+        assert db.has_open_position("m1") is True
+    _ok("V2-C3: closed=True without 0.99/0.01 prices -> position stays open")
+
+
+def test_v2c3_clean_settlement_closes():
+    """V2-C3 happy-path: clean 1.0/0.0 settlement closes correctly."""
+    from polyweat.db import Database
+    from polyweat.trading.trader import _reconcile_positions
+
+    class _FakeGamma:
+        def fetch_market(self, _mid):
+            return {"closed": True}
+
+        @staticmethod
+        def normalize(_raw):
+            return {
+                "outcomes": ["Yes", "No"],
+                "prices": [1.0, 0.0],
+            }
+
+    with tempfile.TemporaryDirectory() as td_:
+        db = Database(Path(td_) / "test.db")
+        db.upsert_position("m1", "t1", "Title", "YES", 0.97, 1.0, 1.03, "open")
+        n = _reconcile_positions(db, _FakeGamma())
+        assert n == 1, f"expected 1 close, got {n}"
+        assert db.has_open_position("m1") is False
+        # We won so realized PnL is positive ~$0.0309 -> daily loss = 0.
+        assert abs(db.daily_loss_today() - 0.0) < 1e-6
+    _ok("V2-C3: clean YES win -> position closed, no daily loss recorded")
+
+
+def test_v2c3_mismatched_arrays_left_open():
+    """V2-C3: outcomes/prices array length mismatch leaves the position open."""
+    from polyweat.db import Database
+    from polyweat.trading.trader import _reconcile_positions
+
+    class _FakeGamma:
+        def fetch_market(self, _mid):
+            return {"closed": True}
+
+        @staticmethod
+        def normalize(_raw):
+            # outcomes shorter than prices -> mismatch
+            return {"outcomes": ["Yes"], "prices": [1.0, 0.0]}
+
+    with tempfile.TemporaryDirectory() as td_:
+        db = Database(Path(td_) / "test.db")
+        db.upsert_position("m1", "t1", "Title", "YES", 0.97, 1.0, 1.03, "open")
+        n = _reconcile_positions(db, _FakeGamma())
+        assert n == 0
+        assert db.has_open_position("m1") is True
+    _ok("V2-C3: mismatched outcomes/prices arrays leave position open")
+
+
+def test_v2i2_one_bad_market_doesnt_starve_others():
+    """V2-I2: a malformed market for one position must not block the others."""
+    from polyweat.db import Database
+    from polyweat.trading.trader import _reconcile_positions
+
+    class _FakeGamma:
+        def fetch_market(self, market_id):
+            return {"closed": True}
+
+        @staticmethod
+        def normalize(raw):
+            # First call raises (simulates a malformed Gamma row).
+            # Second call returns a clean settlement.
+            _FakeGamma._calls += 1
+            if _FakeGamma._calls == 1:
+                raise ValueError("simulated bad market")
+            return {"outcomes": ["Yes", "No"], "prices": [1.0, 0.0]}
+
+        _calls = 0
+
+    with tempfile.TemporaryDirectory() as td_:
+        db = Database(Path(td_) / "test.db")
+        db.upsert_position("m_bad", "t1", "Title", "YES", 0.97, 1.0, 1.03, "open")
+        db.upsert_position("m_good", "t2", "Title", "YES", 0.97, 1.0, 1.03, "open")
+        n = _reconcile_positions(db, _FakeGamma())
+        # The bad one is left open, the good one is closed.
+        assert n == 1
+        assert db.has_open_position("m_bad") is True
+        assert db.has_open_position("m_good") is False
+    _ok("V2-I2: bad market doesn't starve good markets in reconciliation")
+
+
+def test_v2i3_decisions_in_retention():
+    """V2-I3: decisions table is in the retention sweep."""
+    from polyweat.db import Database
+    with tempfile.TemporaryDirectory() as td_:
+        db = Database(Path(td_) / "test.db")
+        # Insert an old decision row.
+        old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        db.insert_decision({
+            "market_id": "m-old", "title": "t", "city": "X",
+            "target_date": None, "market_kind": "highest_gte",
+            "threshold_c": 26.7, "threshold_f": 80.0, "outcome": "YES",
+            "forecast_value_c": 31.0, "temp_distance_c": 4.3,
+            "bot_probability": 0.97, "confidence_score": 0.95,
+            "market_price": 0.97, "spread_percent": 1.0, "liquidity_usd": 500.0,
+            "decision": "SKIP", "skip_reason": "test",
+            "hours_to_resolution": 5.0, "proposed_price": None,
+            "proposed_size_usd": None, "token_id": None,
+            "timestamp": old,
+        })
+        with db._conn() as c:
+            c.execute("UPDATE decisions SET timestamp = ?", (old,))
+        deleted = db.purge_old_rows(retention_days=7)
+        assert deleted >= 1, deleted
+    _ok("V2-I3: decisions purged by retention sweep")
+
+
+def test_v2i4_range_regex_no_time_match():
+    """V2-I4: range regex no longer false-matches time strings."""
+    from polyweat.parser.threshold_parser import parse_threshold
+
+    # No unit on either number -> not a range
+    out = parse_threshold("Heatwave between 7am and 9am tomorrow?")
+    assert out["market_kind"] != "range", out
+    out = parse_threshold("Forecast for between 1 and 3 PM in NYC")
+    assert out["market_kind"] != "range", out
+    # Unit on at least one number -> still a range
+    out = parse_threshold("Heatwave between 95F and 100F next week?")
+    assert out["market_kind"] == "range", out
+    _ok("V2-I4: range regex requires explicit temperature unit")
+
+
+def test_v2i6_entries_count_after_order():
+    """V2-I6: SKIP decisions don't bump entries_count; trader bumps it
+    explicitly when an order is accepted."""
+    from polyweat.db import Database
+    with tempfile.TemporaryDirectory() as td_:
+        db = Database(Path(td_) / "test.db")
+        db.insert_decision({
+            "market_id": "m1", "title": "t", "city": None,
+            "target_date": None, "market_kind": "unknown",
+            "threshold_c": None, "threshold_f": None, "outcome": "SKIP",
+            "forecast_value_c": None, "temp_distance_c": None,
+            "bot_probability": None, "confidence_score": None,
+            "market_price": None, "spread_percent": None, "liquidity_usd": None,
+            "decision": "SKIP", "skip_reason": "test",
+            "hours_to_resolution": None, "proposed_price": None,
+            "proposed_size_usd": None, "token_id": None,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+        rows = db.get_daily_stats(days=1)
+        assert rows[0]["entries_count"] == 0
+        assert rows[0]["skips_count"] == 1
+        # An ENTER decision alone does NOT bump entries (it's the trader's job).
+        db.insert_decision({
+            "market_id": "m2", "title": "t", "city": None,
+            "target_date": None, "market_kind": "highest_gte",
+            "threshold_c": None, "threshold_f": None, "outcome": "YES",
+            "forecast_value_c": None, "temp_distance_c": None,
+            "bot_probability": None, "confidence_score": None,
+            "market_price": None, "spread_percent": None, "liquidity_usd": None,
+            "decision": "ENTER", "skip_reason": None,
+            "hours_to_resolution": None, "proposed_price": 0.97,
+            "proposed_size_usd": 1.0, "token_id": "tok",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+        rows = db.get_daily_stats(days=1)
+        assert rows[0]["entries_count"] == 0, "entries should be bumped by trader, not insert_decision"
+        # Now trader confirms the order - bump.
+        db.bump_entries_count()
+        rows = db.get_daily_stats(days=1)
+        assert rows[0]["entries_count"] == 1
+    _ok("V2-I6: entries_count is bumped only when trader confirms order")
+
+
+def test_v2i7_set_passive_external_id():
+    """V2-I7: public API exists for updating passive_orders.external_order_id."""
+    from polyweat.db import Database
+    with tempfile.TemporaryDirectory() as td_:
+        db = Database(Path(td_) / "test.db")
+        po_pk = db.insert_passive_order(
+            market_id="m1", token_id="t", outcome="YES",
+            price=0.97, size_usd=1.0,
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=180),
+            external_order_id=None, note="",
+        )
+        db.set_passive_order_external_id(po_pk, "ext-xyz", "live submit")
+        row = db.find_passive_order_by_external_id("ext-xyz")
+        assert row is not None
+        assert row["external_order_id"] == "ext-xyz"
+    _ok("V2-I7: set_passive_order_external_id is public")
+
+
+def test_v2i8_open_passive_count_required():
+    """V2-I8: open_passive_count is keyword-only required (not optional)."""
+    import inspect
+    from polyweat.strategy.decision import make_decision
+    sig = inspect.signature(make_decision)
+    p = sig.parameters["open_passive_count"]
+    assert p.default is inspect.Parameter.empty, (
+        "open_passive_count should not have a default value"
+    )
+    assert p.kind == inspect.Parameter.KEYWORD_ONLY
+    _ok("V2-I8: open_passive_count is keyword-only required")
+
+
+# =====================================================================
 # Runner
 # =====================================================================
 
@@ -485,6 +780,20 @@ def main() -> int:
     test_passive_count_helper()
     test_purge_old_rows()
     test_threshold_picker_proximity()
+
+    print("\n[v2 regressions]")
+    print("-" * 50)
+    test_v2c1_longshot_flow()
+    test_v2c2_inflight_blocks_duplicate()
+    test_v2c3_premature_close_skipped()
+    test_v2c3_clean_settlement_closes()
+    test_v2c3_mismatched_arrays_left_open()
+    test_v2i2_one_bad_market_doesnt_starve_others()
+    test_v2i3_decisions_in_retention()
+    test_v2i4_range_regex_no_time_match()
+    test_v2i6_entries_count_after_order()
+    test_v2i7_set_passive_external_id()
+    test_v2i8_open_passive_count_required()
 
     print("\n" + "=" * 50)
     print("All tests passed.")

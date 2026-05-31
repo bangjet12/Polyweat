@@ -128,3 +128,7 @@ class TradeDecision:
     proposed_price: Optional[float] = None  # the price we will (or did) try
     proposed_size_usd: Optional[float] = None
     token_id: Optional[str] = None
+    # True only when the operator opted in (ALLOW_LONGSHOT=true) AND the
+    # decision engine routed the trade as a longshot. Lets the post-decision
+    # risk gate know to relax the standard 0.95-0.985 entry band.
+    is_longshot: bool = False

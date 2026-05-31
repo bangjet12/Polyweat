@@ -83,12 +83,21 @@ _EXACT_RE = re.compile(
 )
 # Range / between markets - any of these patterns -> SKIP via market_kind="range".
 # Numbers may be immediately followed by an optional unit (F, C, °F, °C, deg).
+# To avoid false-positives on time strings ("between 7am and 9am") and
+# generic numeric ranges ("between 1 and 3"), we require an explicit
+# temperature unit (F/C/°F/°C/degrees) on at least one side.
 _RANGE_RE = re.compile(
-    r"\bbetween\s+\d{1,3}(?:\.\d+)?\s*(?:°|deg(?:rees)?\s*)?[FC]?\b"
-    r".{0,12}\band\s+\d{1,3}(?:\.\d+)?"
-    r"|\bfrom\s+\d{1,3}(?:\.\d+)?\s*(?:°|deg(?:rees)?\s*)?[FC]?\b"
-    r".{0,12}\bto\s+\d{1,3}(?:\.\d+)?"
-    r"|\b\d{1,3}(?:\.\d+)?\s*(?:°|deg)?\s*[FC]?\s*(?:to|–|—|-)\s*\d{1,3}(?:\.\d+)?\s*(?:°|deg)?\s*[FC]\b",
+    # "between N°F and M°F" - unit required on at least one side
+    r"\bbetween\s+\d{1,3}(?:\.\d+)?\s*(?:°|deg(?:rees)?)?\s*[FC]"
+    r"\b.{0,12}\band\s+\d{1,3}(?:\.\d+)?"
+    r"|\bbetween\s+\d{1,3}(?:\.\d+)?"
+    r"\b.{0,12}\band\s+\d{1,3}(?:\.\d+)?\s*(?:°|deg(?:rees)?)?\s*[FC]\b"
+    # "from N to M degrees|F|C"
+    r"|\bfrom\s+\d{1,3}(?:\.\d+)?\s*(?:°|deg(?:rees)?)?\s*[FC]?"
+    r"\b.{0,12}\bto\s+\d{1,3}(?:\.\d+)?\s*(?:°|deg(?:rees)?\b|[FC]\b)"
+    # "N°F to M°F" / "N-M°F"
+    r"|\b\d{1,3}(?:\.\d+)?\s*(?:°|deg)?\s*[FC]?\s*(?:to|–|—|-)"
+    r"\s*\d{1,3}(?:\.\d+)?\s*(?:°|deg)?\s*[FC]\b",
     re.IGNORECASE,
 )
 
