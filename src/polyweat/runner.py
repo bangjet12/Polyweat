@@ -84,7 +84,8 @@ class Runner:
             log.warning("startup passive reconciliation failed: %s", exc)
 
         # Sweep stale ``orders`` rows. Only LiveTrader has the exchange
-        # client; it knows how to look them up.
+        # client; it knows how to look them up. Per-row try/except so one
+        # malformed row can't starve the rest of the sweep.
         inflight = self.db.list_inflight_orders()
         if inflight:
             log.warning(
@@ -93,7 +94,15 @@ class Runner:
                 len(inflight),
             )
             for row in inflight:
-                self.trader.reconcile_inflight_order(row)
+                try:
+                    self.trader.reconcile_inflight_order(row)
+                except Exception as exc:  # noqa: BLE001 - log + continue
+                    log.exception(
+                        "startup: reconcile_inflight_order failed for "
+                        "order pk=%s: %s",
+                        row["id"], exc,
+                    )
+                    continue
 
     # ------------------------------------------------------------------
     # Forecast cache (per cycle)

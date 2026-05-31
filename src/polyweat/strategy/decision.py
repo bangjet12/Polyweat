@@ -59,7 +59,13 @@ def _is_today_in_city_tz(end: datetime, city_tz: Optional[str]) -> bool:
         try:
             tz = ZoneInfo(city_tz)
         except Exception:  # noqa: BLE001
+            log.debug(
+                "today-gate: TZ %r unrecognized, falling back to UTC", city_tz
+            )
             tz = None
+    elif not city_tz:
+        log.debug("today-gate: no city_tz on parsed market, falling back to UTC")
+
     if tz is None:
         local_end = end.astimezone(timezone.utc)
         local_now = datetime.now(timezone.utc)
@@ -153,14 +159,26 @@ def make_decision(
     # By default the bot only trades markets that resolve TODAY in the
     # city's local timezone. Tomorrow's and later markets are skipped
     # even if they technically fit within MAX_HOURS_TO_RESOLUTION.
-    if cfg.restrict_to_today and pm.end_time is not None:
-        if not _is_today_in_city_tz(pm.end_time, pm.city_tz):
-            local_date = pm.end_time
+    #
+    # We prefer ``pm.target_date`` (the parser's view of the question's
+    # content day, e.g. "today" / "tomorrow" / "May 30") over
+    # ``pm.end_time`` (Polymarket's close-of-trading timestamp). Polymarket
+    # commonly sets ``endDate`` a few hours past local midnight on the
+    # next day to give operators time to settle, which would
+    # mis-classify a "today's high" market as tomorrow's.
+    if cfg.restrict_to_today:
+        ref = pm.target_date if pm.target_date is not None else pm.end_time
+        if ref is not None and not _is_today_in_city_tz(ref, pm.city_tz):
+            local_date = ref
             try:
                 if pm.city_tz and ZoneInfo is not None:
-                    local_date = pm.end_time.astimezone(ZoneInfo(pm.city_tz))
-            except Exception:  # noqa: BLE001
-                pass
+                    local_date = ref.astimezone(ZoneInfo(pm.city_tz))
+            except Exception:  # noqa: BLE001 - best-effort label
+                # Fall back to UTC date so the skip reason still renders
+                # something meaningful.
+                if local_date.tzinfo is None:
+                    local_date = local_date.replace(tzinfo=timezone.utc)
+                local_date = local_date.astimezone(timezone.utc)
             base.skip_reason = (
                 f"not_today_market_resolves_{local_date.date().isoformat()}"
             )

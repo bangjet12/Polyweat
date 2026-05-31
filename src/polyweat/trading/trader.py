@@ -159,9 +159,14 @@ class DryRunTrader(BaseTrader):
                 log.info("[DRY] passive order %s expired", row["id"])
 
     def reconcile_inflight_order(self, row) -> None:
-        """No-op for dry-run trader (no real exchange to query)."""
-        # In DRY_RUN there should be no rows where dry_run=0 anyway, but if
-        # someone switches modes mid-DB, just close them with a clear note.
+        """Cancel any stale live-mode rows that survived a mode flip.
+
+        DryRunTrader has no exchange to query, so any leftover ``orders``
+        row with ``dry_run=0`` came from a previous LIVE run that hit
+        Ctrl-C / crashed and is now being launched in DRY_RUN. We mark
+        the row cancelled with a clear note so it stops blocking
+        ``has_inflight_order`` on the next scan.
+        """
         self.db.update_order_status(
             int(row["id"]),
             status="cancelled",
@@ -364,7 +369,16 @@ class LiveTrader(BaseTrader):
             note="LIVE pending - awaiting exchange ack",
         )
 
-        ext_id = self._place_limit_buy(td.token_id or "", price, size_shares)
+        try:
+            ext_id = self._place_limit_buy(td.token_id or "", price, size_shares)
+        except Exception:  # noqa: BLE001 - leave row pending for reconciliation
+            log.exception(
+                "[LIVE] _place_limit_buy raised for %s; leaving row pending "
+                "for startup reconciliation",
+                td.market_id,
+            )
+            return order_pk
+
         if ext_id:
             self.db.update_order_status(
                 order_pk, status="submitted",
@@ -387,11 +401,23 @@ class LiveTrader(BaseTrader):
                 td.outcome, td.market_id, price, size_usd, ext_id,
             )
         else:
-            self.db.update_order_status(
-                order_pk, status="rejected",
-                note="LIVE order rejected by exchange",
+            # `_place_limit_buy` returns None for two distinct cases:
+            #  1. Exchange RAISED  -> exception logged inside the helper.
+            #  2. Exchange ACK'd but the response had no parsable id.
+            # Case 2 is dangerous: a real order may live at the exchange
+            # with no local id we can use to reconcile. We DO NOT mark
+            # the row 'rejected' - we keep it 'pending' so
+            # has_inflight_order() keeps blocking the market and the
+            # operator notices on the next status command.
+            log.error(
+                "[LIVE] _place_limit_buy returned no id for %s. Leaving "
+                "row pending; investigate manually before next live entry.",
+                td.market_id,
             )
-            log.warning("[LIVE] order rejected for %s", td.market_id)
+            self.db.update_order_status(
+                order_pk, status="pending",
+                note="LIVE no exchange id parsed - manual review required",
+            )
         return order_pk
 
     def _passive(self, td: TradeDecision) -> Optional[int]:

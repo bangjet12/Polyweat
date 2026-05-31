@@ -751,14 +751,55 @@ def test_v2i8_open_passive_count_required():
 # =====================================================================
 
 def test_v3_today_only_allows_today():
-    """RESTRICT_TO_TODAY=true: a market resolving later today PASSES."""
+    """RESTRICT_TO_TODAY=true: a market resolving later today PASSES.
+
+    Deterministic: we construct end_time/target_date that are guaranteed
+    to be the same NY-local date as 'now in NY' and within the bot's
+    max_hours_to_resolution.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        return  # pragma: no cover - test skipped on <3.9
+
     from polyweat.config import load_config
+    from polyweat.models import ParsedMarket
     from polyweat.strategy.decision import make_decision
 
     cfg = load_config()
     assert cfg.restrict_to_today is True
+    # Widen the hours-to-resolution gate so we test the today-gate in isolation.
+    cfg.max_hours_to_resolution = 36.0
 
-    pm = _build_pm_yes()  # end_time = now + 8h, target = same
+    ny = ZoneInfo("America/New_York")
+    now_ny = datetime.now(timezone.utc).astimezone(ny)
+    # Pick the next time-of-day that is (a) still today in NY and
+    # (b) at least 1h from now. Try noon, 17:00, 23:00 in that order.
+    target_ny = None
+    for hour in (12, 17, 23):
+        cand = now_ny.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if cand > now_ny + timedelta(minutes=30) and cand.date() == now_ny.date():
+            target_ny = cand
+            break
+    if target_ny is None:
+        # Pathological: we're past 23:00 NY local -> just bump 30m.
+        target_ny = now_ny + timedelta(minutes=30)
+    target = target_ny.astimezone(timezone.utc)
+
+    pm = ParsedMarket(
+        market_id="m-today", title="Will high in NYC exceed 80F today?",
+        description="",
+        end_time=target,
+        yes_token_id="y", no_token_id="n",
+        yes_price=0.97, no_price=0.03,
+        liquidity_usd=600.0,
+        city="New York", city_lat=40.7, city_lon=-74.0,
+        city_tz="America/New_York",
+        target_date=target,
+        threshold_c=26.7, threshold_f=80.0,
+        market_kind="highest_gte", unit="F",
+        rules_clear=True, parse_score=1.0,
+    )
     fc = _build_fc(31.0)
     book = _build_book(0.97, 0.96)
     td = make_decision(
@@ -766,17 +807,109 @@ def test_v3_today_only_allows_today():
         has_open_position=False, open_positions_count=0,
         open_passive_count=0, daily_loss_so_far_usd=0.0,
     )
-    # Note: depending on UTC/local time at run, end_time = now+8h could
-    # cross midnight in NY TZ. So just assert that, IF it skipped, the
-    # reason is the today-gate; otherwise it ENTERed.
-    assert td.decision in ("ENTER", "SKIP")
-    if td.decision == "SKIP":
-        # Only acceptable skip reason here is the today gate (or nothing
-        # else we test). We tolerate this because of TZ boundaries.
-        assert "not_today_market_resolves" in (td.skip_reason or "") or td.skip_reason in (
-            None, "",
+    assert td.decision == "ENTER", (
+        f"today's market should ENTER, got {td.decision} ({td.skip_reason})"
+    )
+    assert "not_today_market_resolves" not in (td.skip_reason or "")
+    _ok("v3: today's market ENTERs (deterministic NY-local same day)")
+
+
+def test_v3_today_gate_uses_target_date():
+    """I1 fix: the today gate prefers pm.target_date over pm.end_time so
+    that markets whose endDate slips a few hours into the next UTC day
+    aren't misclassified as 'tomorrow's market'."""
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        return
+
+    from polyweat.config import load_config
+    from polyweat.models import ParsedMarket
+    from polyweat.strategy.decision import make_decision
+
+    cfg = load_config()
+    cfg.max_hours_to_resolution = 36.0  # let today gate be the deciding factor
+
+    ny = ZoneInfo("America/New_York")
+    now_ny = datetime.now(timezone.utc).astimezone(ny)
+    target = now_ny.replace(hour=14, minute=0, second=0, microsecond=0)
+    if target <= now_ny:
+        target = (now_ny + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    target_utc = target.astimezone(timezone.utc)
+    end_late = (target + timedelta(days=1)).replace(hour=2)
+    end_utc = end_late.astimezone(timezone.utc)
+
+    pm = ParsedMarket(
+        market_id="m-late-end", title="Will high in NYC exceed 80F today?",
+        description="",
+        end_time=end_utc,
+        yes_token_id="y", no_token_id="n",
+        yes_price=0.97, no_price=0.03,
+        liquidity_usd=600.0,
+        city="New York", city_lat=40.7, city_lon=-74.0,
+        city_tz="America/New_York",
+        target_date=target_utc,
+        threshold_c=26.7, threshold_f=80.0,
+        market_kind="highest_gte", unit="F",
+        rules_clear=True, parse_score=1.0,
+    )
+    fc = _build_fc(31.0)
+    book = _build_book(0.97, 0.96)
+    td = make_decision(
+        pm, fc, book, None, cfg,
+        has_open_position=False, open_positions_count=0,
+        open_passive_count=0, daily_loss_so_far_usd=0.0,
+    )
+    assert "not_today_market_resolves" not in (td.skip_reason or ""), (
+        f"today-gate falsely fired despite target_date being today; "
+        f"skip_reason={td.skip_reason!r}"
+    )
+    _ok(f"v3 (I1): today gate uses target_date over end_time ({td.decision})")
+
+
+def test_v3_longshot_without_opt_in_blocked():
+    """N1: a forged is_longshot=True with ALLOW_LONGSHOT=false is rejected."""
+    from polyweat.config import load_config
+    from polyweat.db import Database
+    from polyweat.models import TradeDecision
+    from polyweat.trading.risk import pre_trade_checks
+
+    cfg = load_config()
+    assert cfg.allow_longshot is False
+    with tempfile.TemporaryDirectory() as td_:
+        db = Database(Path(td_) / "test.db")
+        td = TradeDecision(
+            market_id="m1", title="t", city=None, target_date=None,
+            market_kind="highest_gte", threshold_c=None, threshold_f=None,
+            outcome="YES", forecast_value_c=None, temp_distance_c=None,
+            bot_probability=None, confidence_score=None, market_price=None,
+            spread_percent=None, liquidity_usd=None,
+            decision="ENTER", skip_reason=None,
+            timestamp=datetime.now(timezone.utc),
+            proposed_price=0.40, proposed_size_usd=1.0, token_id="tok",
+            is_longshot=True,  # forged flag
         )
-    _ok(f"v3: today-or-skip path OK (got {td.decision} {td.skip_reason})")
+        chk = pre_trade_checks(td, db, cfg)
+        assert not chk.ok
+        assert chk.reason == "longshot_without_opt_in"
+    _ok("v3 (N1): is_longshot without ALLOW_LONGSHOT -> risk gate refuses")
+
+
+def test_v3_post_order_no_id_keeps_pending():
+    """I3: a pending row keeps blocking has_inflight_order."""
+    from polyweat.db import Database
+    with tempfile.TemporaryDirectory() as td_:
+        db = Database(Path(td_) / "test.db")
+        order_pk = db.insert_order(
+            market_id="m-noid", token_id="tok", outcome="YES",
+            side="BUY", order_type="LIMIT",
+            price=0.97, size_usd=1.0, size_shares=1.03,
+            status="pending", dry_run=False,
+            external_order_id=None, note="simulated no-id ack",
+        )
+        assert db.has_inflight_order("m-noid") is True
+        assert len(db.list_inflight_orders()) == 1
+    _ok("v3 (I3): pending row blocks duplicate via has_inflight_order")
 
 
 def test_v3_today_only_skips_tomorrow():
@@ -909,8 +1042,11 @@ def main() -> int:
     print("\n[v3 today-only gate]")
     print("-" * 50)
     test_v3_today_only_allows_today()
+    test_v3_today_gate_uses_target_date()
     test_v3_today_only_skips_tomorrow()
     test_v3_restrict_to_today_can_be_disabled()
+    test_v3_longshot_without_opt_in_blocked()
+    test_v3_post_order_no_id_keeps_pending()
 
     print("\n" + "=" * 50)
     print("All tests passed.")

@@ -34,6 +34,12 @@ def pre_trade_checks(td: TradeDecision, db: Database, cfg: Config) -> RiskCheck:
     if td.proposed_size_usd is None or td.proposed_size_usd <= 0:
         return RiskCheck(False, "invalid_size")
 
+    # Defense-in-depth: if a future code path sets is_longshot=True without
+    # the operator having opted in, refuse the trade outright. The flag
+    # alone must NOT be enough to bypass MIN_ENTRY_PRICE.
+    if td.is_longshot and not cfg.allow_longshot:
+        return RiskCheck(False, "longshot_without_opt_in")
+
     # Always reject duplicates (the cap above doesn't catch a same-market re-entry).
     if db.has_open_position(td.market_id):
         return RiskCheck(False, "duplicate_market_position")
