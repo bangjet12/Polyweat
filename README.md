@@ -23,6 +23,7 @@ If any of that fails, it does **not** trade. It either parks the market on a wat
 | Confidence score | 0.90 | 0.95 |
 | Forecast distance from threshold | 2.0 °C / 3.5 °F | 3.0 °C / 5.0 °F |
 | Time to resolution | ≤ 18h | ≤ 12h (best ≤ 6h) |
+| **Resolves TODAY** in city's local TZ | **Required** by default (set `RESTRICT_TO_TODAY=false` to allow tomorrow+) | – |
 | Spread | ≤ 1.5% | ≤ 1.0% |
 | Liquidity | ≥ $250 | ≥ $500 |
 | Entry price (ask) | ≥ 0.95 | – |
