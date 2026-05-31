@@ -17,6 +17,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover
+    ZoneInfo = None  # type: ignore
+
 from polyweat.config import Config
 from polyweat.logger import get_logger
 from polyweat.models import OrderbookSnapshot, ParsedMarket, TradeDecision, WeatherForecast
@@ -39,6 +44,29 @@ def _hours_until(end: Optional[datetime]) -> Optional[float]:
         end = end.replace(tzinfo=timezone.utc)
     delta = end - datetime.now(timezone.utc)
     return delta.total_seconds() / 3600.0
+
+
+def _is_today_in_city_tz(end: datetime, city_tz: Optional[str]) -> bool:
+    """True iff ``end`` falls on the same calendar day as ``now``,
+    measured in the city's local TZ.
+
+    Falls back to UTC if the TZ is missing or unrecognized.
+    """
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    tz = None
+    if city_tz and ZoneInfo is not None:
+        try:
+            tz = ZoneInfo(city_tz)
+        except Exception:  # noqa: BLE001
+            tz = None
+    if tz is None:
+        local_end = end.astimezone(timezone.utc)
+        local_now = datetime.now(timezone.utc)
+    else:
+        local_end = end.astimezone(tz)
+        local_now = datetime.now(timezone.utc).astimezone(tz)
+    return local_end.date() == local_now.date()
 
 
 def make_decision(
@@ -120,6 +148,23 @@ def make_decision(
     if hours_to_res > cfg.max_hours_to_resolution:
         base.skip_reason = f"hours_to_resolution_too_far_{hours_to_res:.1f}"
         return base
+
+    # ---------- TODAY-only gate ----------
+    # By default the bot only trades markets that resolve TODAY in the
+    # city's local timezone. Tomorrow's and later markets are skipped
+    # even if they technically fit within MAX_HOURS_TO_RESOLUTION.
+    if cfg.restrict_to_today and pm.end_time is not None:
+        if not _is_today_in_city_tz(pm.end_time, pm.city_tz):
+            local_date = pm.end_time
+            try:
+                if pm.city_tz and ZoneInfo is not None:
+                    local_date = pm.end_time.astimezone(ZoneInfo(pm.city_tz))
+            except Exception:  # noqa: BLE001
+                pass
+            base.skip_reason = (
+                f"not_today_market_resolves_{local_date.date().isoformat()}"
+            )
+            return base
 
     # ---------- forecast ----------
     if fc is None:

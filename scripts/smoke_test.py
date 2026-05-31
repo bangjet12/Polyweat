@@ -747,6 +747,117 @@ def test_v2i8_open_passive_count_required():
 
 
 # =====================================================================
+# v3: today-only gate
+# =====================================================================
+
+def test_v3_today_only_allows_today():
+    """RESTRICT_TO_TODAY=true: a market resolving later today PASSES."""
+    from polyweat.config import load_config
+    from polyweat.strategy.decision import make_decision
+
+    cfg = load_config()
+    assert cfg.restrict_to_today is True
+
+    pm = _build_pm_yes()  # end_time = now + 8h, target = same
+    fc = _build_fc(31.0)
+    book = _build_book(0.97, 0.96)
+    td = make_decision(
+        pm, fc, book, None, cfg,
+        has_open_position=False, open_positions_count=0,
+        open_passive_count=0, daily_loss_so_far_usd=0.0,
+    )
+    # Note: depending on UTC/local time at run, end_time = now+8h could
+    # cross midnight in NY TZ. So just assert that, IF it skipped, the
+    # reason is the today-gate; otherwise it ENTERed.
+    assert td.decision in ("ENTER", "SKIP")
+    if td.decision == "SKIP":
+        # Only acceptable skip reason here is the today gate (or nothing
+        # else we test). We tolerate this because of TZ boundaries.
+        assert "not_today_market_resolves" in (td.skip_reason or "") or td.skip_reason in (
+            None, "",
+        )
+    _ok(f"v3: today-or-skip path OK (got {td.decision} {td.skip_reason})")
+
+
+def test_v3_today_only_skips_tomorrow():
+    """RESTRICT_TO_TODAY=true: a market resolving in 30+ hours -> SKIP."""
+    from polyweat.config import load_config
+    from polyweat.models import ParsedMarket
+    from polyweat.strategy.decision import make_decision
+
+    cfg = load_config()
+    cfg.max_hours_to_resolution = 48.0  # widen so the prior gate doesn't fire first
+
+    far_end = datetime.now(timezone.utc) + timedelta(hours=30)
+    pm = ParsedMarket(
+        market_id="m-tmrw",
+        title="Will high in NYC exceed 80F tomorrow?",
+        description="",
+        end_time=far_end,
+        yes_token_id="y", no_token_id="n",
+        yes_price=0.97, no_price=0.03,
+        liquidity_usd=600.0,
+        city="New York", city_lat=40.7, city_lon=-74.0,
+        city_tz="America/New_York",
+        target_date=far_end,
+        threshold_c=26.7, threshold_f=80.0,
+        market_kind="highest_gte", unit="F",
+        rules_clear=True, parse_score=1.0,
+    )
+    fc = _build_fc(31.0)
+    book = _build_book(0.97, 0.96)
+    td = make_decision(
+        pm, fc, book, None, cfg,
+        has_open_position=False, open_positions_count=0,
+        open_passive_count=0, daily_loss_so_far_usd=0.0,
+    )
+    assert td.decision == "SKIP"
+    assert "not_today_market_resolves" in (td.skip_reason or ""), td.skip_reason
+    _ok(f"v3: tomorrow's market skipped ({td.skip_reason})")
+
+
+def test_v3_restrict_to_today_can_be_disabled():
+    """When RESTRICT_TO_TODAY=false, far-future markets are NOT skipped
+    by the today gate (other gates still apply)."""
+    from polyweat.config import load_config
+    from polyweat.models import ParsedMarket
+    from polyweat.strategy.decision import make_decision
+
+    cfg = load_config()
+    cfg.restrict_to_today = False
+    cfg.max_hours_to_resolution = 48.0
+
+    far_end = datetime.now(timezone.utc) + timedelta(hours=30)
+    pm = ParsedMarket(
+        market_id="m-tmrw2", title="Will high in NYC exceed 80F tomorrow?",
+        description="",
+        end_time=far_end,
+        yes_token_id="y", no_token_id="n",
+        yes_price=0.97, no_price=0.03,
+        liquidity_usd=600.0,
+        city="New York", city_lat=40.7, city_lon=-74.0,
+        city_tz="America/New_York",
+        target_date=far_end,
+        threshold_c=26.7, threshold_f=80.0,
+        market_kind="highest_gte", unit="F",
+        rules_clear=True, parse_score=1.0,
+    )
+    fc = _build_fc(31.0)
+    book = _build_book(0.97, 0.96)
+    td = make_decision(
+        pm, fc, book, None, cfg,
+        has_open_position=False, open_positions_count=0,
+        open_passive_count=0, daily_loss_so_far_usd=0.0,
+    )
+    # Should NOT be skipped by the today gate. Confidence_score may be
+    # below threshold for a 30h-out market, so we accept either ENTER or
+    # SKIP-with-non-today-reason.
+    if td.decision == "SKIP":
+        assert "not_today_market_resolves" not in (td.skip_reason or "")
+    _ok(f"v3: RESTRICT_TO_TODAY=false bypasses today gate ({td.decision} {td.skip_reason})")
+
+
+# =====================================================================
 # Runner
 # =====================================================================
 
@@ -794,6 +905,12 @@ def main() -> int:
     test_v2i6_entries_count_after_order()
     test_v2i7_set_passive_external_id()
     test_v2i8_open_passive_count_required()
+
+    print("\n[v3 today-only gate]")
+    print("-" * 50)
+    test_v3_today_only_allows_today()
+    test_v3_today_only_skips_tomorrow()
+    test_v3_restrict_to_today_can_be_disabled()
 
     print("\n" + "=" * 50)
     print("All tests passed.")

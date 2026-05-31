@@ -131,6 +131,11 @@ class Config:
     allow_exact_temp_markets: bool = False
     allow_ambiguous_markets: bool = False
 
+    # When True (default), the bot only enters markets that resolve TODAY
+    # in the city's local timezone. Markets resolving tomorrow or later
+    # are skipped even if they fall within MAX_HOURS_TO_RESOLUTION.
+    restrict_to_today: bool = True
+
     # ----- Reliability -----
     max_consecutive_scan_failures: int = 5
     scanned_markets_retention_days: int = 7
@@ -211,6 +216,7 @@ def load_config(env_file: Optional[str] = None) -> Config:
         allow_longshot=_get_bool("ALLOW_LONGSHOT", False),
         allow_exact_temp_markets=_get_bool("ALLOW_EXACT_TEMP_MARKETS", False),
         allow_ambiguous_markets=_get_bool("ALLOW_AMBIGUOUS_MARKETS", False),
+        restrict_to_today=_get_bool("RESTRICT_TO_TODAY", True),
         max_consecutive_scan_failures=_get_int("MAX_CONSECUTIVE_SCAN_FAILURES", 5),
         scanned_markets_retention_days=_get_int("SCANNED_MARKETS_RETENTION_DAYS", 7),
         data_dir=Path(_get_str("DATA_DIR", "./data")),

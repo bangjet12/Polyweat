@@ -214,6 +214,8 @@ def cmd_status(cfg: Config, _: argparse.Namespace) -> int:
           f"{cfg.max_entry_price:.3f}")
     print(f"  resolve horizon    : <= {cfg.max_hours_to_resolution:.0f}h "
           f"(best <= {cfg.best_hours_to_resolution:.0f}h)")
+    print(f"  today-only filter  : "
+          f"{'on (only today markets)' if cfg.restrict_to_today else 'off (allow up to max horizon)'}")
     print(f"  prob/conf min      : {cfg.min_bot_probability:.2f} / "
           f"{cfg.min_confidence_score:.2f}")
     print(f"  temp distance min  : {cfg.min_temp_distance_c:.1f}C / "
