@@ -8,12 +8,20 @@ Two backends:
     installed it raises a clear error so we never silently misbehave.
 
 The runner uses :func:`build_trader` to pick the right backend.
+
+Crash safety
+------------
+``LiveTrader._enter`` writes a ``status='pending'`` row to the local
+``orders`` table *before* hitting the network, so that a process death
+between submission and persistence cannot leave a real Polymarket order
+without any local trace. After the exchange replies we update the row
+to ``submitted`` (or ``rejected``).
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from polyweat.config import Config
 from polyweat.db import Database
@@ -154,6 +162,12 @@ class DryRunTrader(BaseTrader):
 # Live trader
 # ---------------------------------------------------------------------
 
+# Live order fill statuses we care about (exchange-side strings).
+_FILLED_STATUSES = {"FILLED", "MATCHED", "PARTIALLY_FILLED", "PARTIAL"}
+_OPEN_STATUSES = {"OPEN", "LIVE", "PENDING", "ACTIVE"}
+_CANCELLED_STATUSES = {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
+
+
 class LiveTrader(BaseTrader):
     """Live trader using py-clob-client. Only activated when both
     ``DRY_RUN=false`` AND ``LIVE_TRADING=true``.
@@ -173,21 +187,23 @@ class LiveTrader(BaseTrader):
 
         if not (
             cfg.polymarket_private_key
-            and cfg.polymarket_proxy_address
             and cfg.polymarket_api_key
             and cfg.polymarket_api_secret
             and cfg.polymarket_api_passphrase
         ):
             raise TraderError(
-                "Live trading requires all Polymarket creds in .env: "
-                "POLYMARKET_PRIVATE_KEY, POLYMARKET_PROXY_ADDRESS, "
-                "POLYMARKET_API_KEY, POLYMARKET_API_SECRET, "
-                "POLYMARKET_API_PASSPHRASE"
+                "Live trading requires Polymarket creds in .env: "
+                "POLYMARKET_PRIVATE_KEY, POLYMARKET_API_KEY, "
+                "POLYMARKET_API_SECRET, POLYMARKET_API_PASSPHRASE "
+                "(POLYMARKET_PROXY_ADDRESS required when "
+                "POLYMARKET_SIGNATURE_TYPE=2)"
+            )
+        if cfg.polymarket_signature_type == 2 and not cfg.polymarket_proxy_address:
+            raise TraderError(
+                "POLYMARKET_SIGNATURE_TYPE=2 (proxy/Magic) requires "
+                "POLYMARKET_PROXY_ADDRESS in .env."
             )
 
-        # py-clob-client constructor signature:
-        #   ClobClient(host, key, chain_id, signature_type=2,
-        #              funder=proxy_address, creds=ApiCreds(...))
         self._POLYGON = POLYGON
         self._OrderArgs = OrderArgs
         try:
@@ -199,15 +215,21 @@ class LiveTrader(BaseTrader):
             api_secret=cfg.polymarket_api_secret,
             api_passphrase=cfg.polymarket_api_passphrase,
         ) if ApiCreds else None
-        self._client = _Clob(
+
+        client_kwargs: Dict[str, Any] = dict(
             host=cfg.clob_api_base,
             key=cfg.polymarket_private_key,
             chain_id=POLYGON,
-            signature_type=2,
-            funder=cfg.polymarket_proxy_address,
+            signature_type=cfg.polymarket_signature_type,
             creds=creds,
         )
-        log.warning("LiveTrader initialized - real orders will be placed.")
+        if cfg.polymarket_signature_type == 2 and cfg.polymarket_proxy_address:
+            client_kwargs["funder"] = cfg.polymarket_proxy_address
+        self._client = _Clob(**client_kwargs)
+        log.warning(
+            "LiveTrader initialized (signature_type=%d) - REAL orders will be placed.",
+            cfg.polymarket_signature_type,
+        )
 
     # ----- helpers -----
 
@@ -232,6 +254,35 @@ class LiveTrader(BaseTrader):
             log.exception("Live order failed: %s", exc)
             return None
 
+    def _exchange_order_status(self, ext_id: str) -> str:
+        """Return the exchange-side normalized status of an order, or ''."""
+        if not ext_id:
+            return ""
+        try:
+            data = self._client.get_order(ext_id)  # type: ignore[attr-defined]
+        except Exception as exc:
+            log.warning("get_order(%s) failed: %s", ext_id, exc)
+            return ""
+        status = ""
+        if isinstance(data, dict):
+            status = str(
+                data.get("status")
+                or data.get("orderStatus")
+                or data.get("state")
+                or ""
+            ).upper()
+        return status
+
+    def _cancel(self, ext_id: str) -> bool:
+        if not ext_id:
+            return False
+        try:
+            self._client.cancel(ext_id)
+            return True
+        except Exception as exc:
+            log.warning("cancel(%s) failed: %s", ext_id, exc)
+            return False
+
     # ----- API -----
 
     def _enter(self, td: TradeDecision) -> Optional[int]:
@@ -240,8 +291,10 @@ class LiveTrader(BaseTrader):
         size_usd = float(td.proposed_size_usd)
         size_shares = round(size_usd / max(price, 1e-9), 4)
 
-        ext_id = self._place_limit_buy(td.token_id or "", price, size_shares)
-        status = "submitted" if ext_id else "rejected"
+        # CRASH-SAFE: write a 'pending' row to the local DB BEFORE we
+        # actually hit the exchange. If we die between the post and the
+        # follow-up update, this row is the breadcrumb that prevents a
+        # ghost position.
         order_pk = self.db.insert_order(
             market_id=td.market_id,
             token_id=td.token_id,
@@ -251,13 +304,19 @@ class LiveTrader(BaseTrader):
             price=price,
             size_usd=size_usd,
             size_shares=size_shares,
-            status=status,
+            status="pending",
             dry_run=False,
-            external_order_id=ext_id,
-            note="LIVE marketable limit",
+            external_order_id=None,
+            note="LIVE pending - awaiting exchange ack",
         )
+
+        ext_id = self._place_limit_buy(td.token_id or "", price, size_shares)
         if ext_id:
-            # Optimistic position; reconciliation can adjust later.
+            self.db.update_order_status(
+                order_pk, status="submitted",
+                external_order_id=ext_id,
+                note="LIVE submitted",
+            )
             self.db.upsert_position(
                 market_id=td.market_id,
                 token_id=td.token_id,
@@ -272,6 +331,12 @@ class LiveTrader(BaseTrader):
                 "[LIVE] ENTER %s %s @ %.4f size=$%.2f order=%s",
                 td.outcome, td.market_id, price, size_usd, ext_id,
             )
+        else:
+            self.db.update_order_status(
+                order_pk, status="rejected",
+                note="LIVE order rejected by exchange",
+            )
+            log.warning("[LIVE] order rejected for %s", td.market_id)
         return order_pk
 
     def _passive(self, td: TradeDecision) -> Optional[int]:
@@ -279,11 +344,12 @@ class LiveTrader(BaseTrader):
         price = float(td.proposed_price)
         size_usd = float(td.proposed_size_usd)
         size_shares = round(size_usd / max(price, 1e-9), 4)
-
-        ext_id = self._place_limit_buy(td.token_id or "", price, size_shares)
         expires_at = datetime.now(timezone.utc) + timedelta(
             seconds=self.cfg.passive_order_expire_seconds
         )
+
+        # Write the passive order BEFORE touching the network so a crash
+        # leaves a breadcrumb. We'll reconcile fill status next cycle.
         po_pk = self.db.insert_passive_order(
             market_id=td.market_id,
             token_id=td.token_id,
@@ -291,10 +357,18 @@ class LiveTrader(BaseTrader):
             price=price,
             size_usd=size_usd,
             expires_at=expires_at,
-            external_order_id=ext_id,
-            note="LIVE passive limit",
+            external_order_id=None,
+            note="LIVE passive pending",
         )
+
+        ext_id = self._place_limit_buy(td.token_id or "", price, size_shares)
         if ext_id:
+            # Persist the external id so reconciliation can find it.
+            with self.db._conn() as c:  # type: ignore[attr-defined]
+                c.execute(
+                    "UPDATE passive_orders SET external_order_id = ?, note = ? WHERE id = ?",
+                    (ext_id, "LIVE passive submitted", po_pk),
+                )
             log.info(
                 "[LIVE] PASSIVE %s %s @ %.4f expires_in=%ds order=%s",
                 td.outcome, td.market_id, price,
@@ -305,7 +379,15 @@ class LiveTrader(BaseTrader):
         return po_pk
 
     def reconcile_passive_orders(self) -> None:
-        """Cancel passive orders whose timer has elapsed."""
+        """Sweep all open passive orders.
+
+        For each open passive:
+          1. Ask the exchange for the current status.
+          2. If FILLED / partially filled -> mark filled and write a
+             position row so caps and PnL are correct.
+          3. If still OPEN and the timer has elapsed -> cancel.
+          4. If cancelled / rejected on the exchange -> mark cancelled.
+        """
         now = datetime.now(timezone.utc)
         for row in self.db.list_open_passive_orders():
             try:
@@ -314,25 +396,130 @@ class LiveTrader(BaseTrader):
                 continue
             if expires_at.tzinfo is None:
                 expires_at = expires_at.replace(tzinfo=timezone.utc)
-            if expires_at > now:
+            ext_id = row["external_order_id"] or ""
+            status = self._exchange_order_status(ext_id) if ext_id else ""
+
+            # 1) Filled while we were sleeping?
+            if status in _FILLED_STATUSES:
+                price = float(row["price"] or 0.0)
+                size_usd = float(row["size_usd"] or 0.0)
+                shares = size_usd / max(price, 1e-9)
+                self.db.upsert_position(
+                    market_id=row["market_id"],
+                    token_id=row["token_id"],
+                    title=row["market_id"],
+                    outcome=row["outcome"] or "YES",
+                    entry_price=price,
+                    size_usd=size_usd,
+                    size_shares=shares,
+                    status="open",
+                )
+                self.db.update_passive_order_status(
+                    int(row["id"]), "filled", "passive filled (reconciled)"
+                )
+                log.info(
+                    "[LIVE] passive %s FILLED -> position created (price=%.4f)",
+                    row["id"], price,
+                )
                 continue
-            ext_id = row["external_order_id"]
-            cancelled = False
-            if ext_id:
-                try:
-                    self._client.cancel(ext_id)
-                    cancelled = True
-                except Exception as exc:
-                    log.warning("cancel(%s) failed: %s", ext_id, exc)
-            self.db.update_passive_order_status(
-                int(row["id"]),
-                "cancelled" if cancelled else "expired",
-                "passive expired" if not cancelled else "passive cancelled",
-            )
+
+            # 2) Cancelled / rejected on the exchange already?
+            if status in _CANCELLED_STATUSES:
+                self.db.update_passive_order_status(
+                    int(row["id"]), "cancelled",
+                    f"exchange status: {status}",
+                )
+                log.info("[LIVE] passive %s cancelled by exchange (%s)", row["id"], status)
+                continue
+
+            # 3) Still open and expired -> cancel.
+            if expires_at <= now:
+                cancelled = self._cancel(ext_id) if ext_id else False
+                self.db.update_passive_order_status(
+                    int(row["id"]),
+                    "cancelled" if cancelled else "expired",
+                    "passive cancelled" if cancelled else "passive expired",
+                )
+                log.info(
+                    "[LIVE] passive %s -> %s",
+                    row["id"], "cancelled" if cancelled else "expired",
+                )
+
+    # ----- position reconciliation -----
+
+    def reconcile_positions_via_market(self, gamma) -> int:
+        """Close any open positions whose Polymarket market has resolved.
+
+        Returns the number of positions closed.
+
+        We use the Gamma API because it returns the resolved outcome
+        prices (1.0 / 0.0) once a market is settled. PnL formula:
+
+            pnl = size_usd * (1 - entry_price)   if our outcome won
+            pnl = -size_usd                       if our outcome lost
+            pnl = size_usd * (mid - entry_price)  for partial / refund
+        """
+        return _reconcile_positions(self.db, gamma)
+
+
+def _reconcile_positions(db: Database, gamma) -> int:
+    """Shared closer used by both live and dry-run traders.
+
+    For each open position, check the Gamma market: if it's closed/resolved
+    we compute realized PnL and mark the position closed. Updates daily
+    stats so MAX_DAILY_LOSS_USD actually engages.
+    """
+    closed = 0
+    for row in db.list_open_positions():
+        market_id = row["market_id"]
+        market = gamma.fetch_market(market_id)
+        if not market:
+            continue
+        if not (market.get("closed") or market.get("resolved")):
+            continue
+
+        nm = gamma.normalize(market)
+        outcomes = nm.get("outcomes") or []
+        prices = nm.get("prices") or []
+
+        winner_idx: Optional[int] = None
+        for i, p in enumerate(prices):
+            try:
+                if p is not None and float(p) >= 0.99:
+                    winner_idx = i
+                    break
+            except (TypeError, ValueError):
+                continue
+
+        my_outcome = (row["outcome"] or "").upper()
+        size_usd = float(row["size_usd"] or 0.0)
+        entry_price = float(row["entry_price"] or 0.0)
+
+        if winner_idx is None:
+            # Resolved but no clear winner (refund / void). Mark closed at 0.
+            db.close_position(market_id, 0.0)
+            closed += 1
             log.info(
-                "[LIVE] passive order %s -> %s",
-                row["id"], "cancelled" if cancelled else "expired",
+                "[reconcile] %s closed - no clear winner, pnl=$0.00",
+                market_id,
             )
+            continue
+
+        winner = (outcomes[winner_idx] or "").strip().upper() if winner_idx < len(outcomes) else ""
+        if winner == my_outcome:
+            # Win: each $1 of cost returns $1 in shares which pay out $1.
+            # Profit per dollar invested = (1 - entry_price) / entry_price.
+            shares = size_usd / max(entry_price, 1e-9)
+            pnl = shares * 1.0 - size_usd  # gross before fees
+        else:
+            pnl = -size_usd
+        db.close_position(market_id, round(pnl, 4))
+        closed += 1
+        log.info(
+            "[reconcile] %s closed (%s won, our %s) pnl=%+.2f",
+            market_id, winner, my_outcome, pnl,
+        )
+    return closed
 
 
 # ---------------------------------------------------------------------
@@ -348,3 +535,8 @@ def build_trader(db: Database, cfg: Config) -> BaseTrader:
         return LiveTrader(db, cfg)
     log.info("Trader running in DRY_RUN mode (no real orders).")
     return DryRunTrader(db, cfg)
+
+
+# Public API: position reconciliation helper used by the runner regardless
+# of trader backend.
+reconcile_positions = _reconcile_positions

@@ -9,9 +9,9 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional
 
 from polyweat.logger import get_logger
 
@@ -176,7 +176,13 @@ def _now_iso() -> str:
 
 
 def _today_str() -> str:
-    return date.today().isoformat()
+    """Return today's date as ISO YYYY-MM-DD in UTC.
+
+    UTC is intentional: daily stats / loss caps must reset at the same wall
+    clock for every operator regardless of VPS timezone. systemd also
+    pins ``TZ=UTC``.
+    """
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 def _to_iso(dt: Optional[datetime]) -> Optional[str]:
@@ -199,6 +205,14 @@ class Database:
     def _conn(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(str(self.path), timeout=30.0)
         conn.row_factory = sqlite3.Row
+        # WAL allows the CLI (`polyweat decisions`, `polyweat positions`) to
+        # read while the runner is writing without hitting SQLITE_BUSY.
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+        except sqlite3.DatabaseError:  # pragma: no cover
+            pass
         try:
             yield conn
             conn.commit()
@@ -398,6 +412,16 @@ class Database:
                 c.execute("SELECT * FROM passive_orders WHERE status = 'open'")
             )
 
+    def count_open_passive_orders(self) -> int:
+        """Number of passive orders that are still pending. They obligate
+        capital and a fill makes them effective positions, so we count them
+        toward MAX_OPEN_POSITIONS as well."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM passive_orders WHERE status = 'open'"
+            ).fetchone()
+            return int(row["n"] if row else 0)
+
     def update_passive_order_status(
         self, order_pk: int, status: str, note: str = ""
     ) -> None:
@@ -495,6 +519,43 @@ class Database:
                 )
             )
 
+    def get_position(self, market_id: str) -> Optional[sqlite3.Row]:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM positions WHERE market_id = ?", (market_id,)
+            ).fetchone()
+
+    def find_passive_order_by_external_id(
+        self, external_order_id: str
+    ) -> Optional[sqlite3.Row]:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM passive_orders WHERE external_order_id = ?",
+                (external_order_id,),
+            ).fetchone()
+
+    def update_order_status(
+        self,
+        order_pk: int,
+        *,
+        status: str,
+        external_order_id: Optional[str] = None,
+        note: str = "",
+    ) -> None:
+        """Update a row in ``orders``. Used to flip 'pending' -> 'submitted'
+        once the live exchange has acknowledged the order."""
+        with self._conn() as c:
+            c.execute(
+                """UPDATE orders
+                   SET status = ?,
+                       external_order_id = COALESCE(?, external_order_id),
+                       note = COALESCE(NULLIF(?, ''), note),
+                       closed_at = CASE WHEN ? IN ('filled','cancelled','rejected')
+                                        THEN ? ELSE closed_at END
+                   WHERE id = ?""",
+                (status, external_order_id, note, status, _now_iso(), order_pk),
+            )
+
     def close_position(self, market_id: str, pnl_usd: float) -> None:
         with self._conn() as c:
             c.execute(
@@ -562,3 +623,30 @@ class Database:
                    VALUES (?,?,?,?)""",
                 (market_id, title, reason, _now_iso()),
             )
+
+    # ----- maintenance -----
+
+    def purge_old_rows(self, retention_days: int) -> int:
+        """Delete rows older than ``retention_days`` from high-churn tables.
+
+        Keeps the SQLite file from growing without bound when the bot has
+        been running for a while.
+        Returns the total number of deleted rows.
+        """
+        if retention_days <= 0:
+            return 0
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat(
+            timespec="seconds"
+        )
+        deleted = 0
+        with self._conn() as c:
+            for table, ts_col in (
+                ("scanned_markets", "seen_at"),
+                ("forecasts", "fetched_at"),
+                ("rejected_markets", "created_at"),
+            ):
+                cur = c.execute(
+                    f"DELETE FROM {table} WHERE {ts_col} < ?", (cutoff,)
+                )
+                deleted += cur.rowcount or 0
+        return deleted

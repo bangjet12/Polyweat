@@ -4,15 +4,15 @@
 # Usage:
 #   sudo bash deploy/install.sh
 #
-# This script:
-#   1. installs Python 3 + venv + pip + sqlite3 + git
+# This script is safe to re-run. It:
+#   1. installs Python 3.11+ (deadsnakes if needed) + venv + pip + sqlite3 + git
 #   2. creates a dedicated `polyweat` system user (no shell)
 #   3. clones / refreshes the repo into /opt/polyweat
 #   4. creates a virtualenv and installs requirements
-#   5. seeds /opt/polyweat/.env from .env.example if missing
-#   6. installs and enables the systemd unit (commented at the bottom)
-#
-# It is safe to re-run.
+#   5. installs `py-clob-client` ONLY when LIVE_TRADING=true in .env
+#   6. seeds /opt/polyweat/.env from .env.example if missing
+#   7. *always* enforces 0600 permissions on /opt/polyweat/.env
+#   8. installs and enables the systemd unit
 
 set -euo pipefail
 
@@ -20,6 +20,8 @@ APP_USER="polyweat"
 APP_DIR="/opt/polyweat"
 REPO_URL="${POLYWEAT_REPO_URL:-https://github.com/bangjet12/Polyweat.git}"
 BRANCH="${POLYWEAT_BRANCH:-main}"
+MIN_PY_MAJOR=3
+MIN_PY_MINOR=9
 
 if [[ "$EUID" -ne 0 ]]; then
   echo "ERROR: please run as root (sudo bash deploy/install.sh)" >&2
@@ -29,6 +31,18 @@ fi
 echo "==> Installing system packages"
 apt-get update -y
 apt-get install -y python3 python3-venv python3-pip sqlite3 git curl ca-certificates
+
+# ---- Verify Python >= 3.9 ---------------------------------------------------
+PY_CMD="python3"
+if ! "$PY_CMD" -c "import sys; sys.exit(0 if sys.version_info >= (${MIN_PY_MAJOR},${MIN_PY_MINOR}) else 1)" 2>/dev/null; then
+  echo "==> System python3 is older than ${MIN_PY_MAJOR}.${MIN_PY_MINOR}; trying to install python3.11 from deadsnakes"
+  apt-get install -y software-properties-common
+  add-apt-repository -y ppa:deadsnakes/ppa
+  apt-get update -y
+  apt-get install -y python3.11 python3.11-venv python3.11-distutils
+  PY_CMD="python3.11"
+fi
+echo "    -> using $($PY_CMD --version)"
 
 echo "==> Creating user '$APP_USER' (if missing)"
 if ! id "$APP_USER" >/dev/null 2>&1; then
@@ -49,7 +63,7 @@ else
 fi
 
 echo "==> Creating Python virtualenv"
-sudo -u "$APP_USER" python3 -m venv "$APP_DIR/.venv"
+sudo -u "$APP_USER" "$PY_CMD" -m venv "$APP_DIR/.venv"
 sudo -u "$APP_USER" "$APP_DIR/.venv/bin/pip" install --upgrade pip wheel
 sudo -u "$APP_USER" "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt"
 sudo -u "$APP_USER" "$APP_DIR/.venv/bin/pip" install -e "$APP_DIR"
@@ -57,9 +71,26 @@ sudo -u "$APP_USER" "$APP_DIR/.venv/bin/pip" install -e "$APP_DIR"
 echo "==> Seeding .env from .env.example (only if .env is missing)"
 if [[ ! -f "$APP_DIR/.env" ]]; then
   cp "$APP_DIR/.env.example" "$APP_DIR/.env"
-  chmod 600 "$APP_DIR/.env"
-  chown "$APP_USER:$APP_USER" "$APP_DIR/.env"
   echo "    -> $APP_DIR/.env created. Edit it before running live."
+fi
+
+# Always enforce strict permissions on .env, even if the operator created it
+# manually before re-running this installer.
+chown "$APP_USER:$APP_USER" "$APP_DIR/.env"
+chmod 600 "$APP_DIR/.env"
+
+# ---- Install py-clob-client only if user opted in to live trading ----------
+LIVE_REQUESTED="false"
+if grep -E '^[[:space:]]*LIVE_TRADING[[:space:]]*=[[:space:]]*true' "$APP_DIR/.env" >/dev/null 2>&1; then
+  if grep -E '^[[:space:]]*DRY_RUN[[:space:]]*=[[:space:]]*false' "$APP_DIR/.env" >/dev/null 2>&1; then
+    LIVE_REQUESTED="true"
+  fi
+fi
+if [[ "$LIVE_REQUESTED" == "true" ]]; then
+  echo "==> LIVE_TRADING=true detected, installing py-clob-client (the [live] extra)"
+  sudo -u "$APP_USER" "$APP_DIR/.venv/bin/pip" install "py-clob-client>=0.17.0"
+else
+  echo "==> .env says DRY_RUN; skipping py-clob-client (install it later if you switch to LIVE)."
 fi
 
 echo "==> Initialising database"
@@ -80,7 +111,9 @@ you must set BOTH in /opt/polyweat/.env:
     DRY_RUN=false
     LIVE_TRADING=true
 
-and also fill in the POLYMARKET_* credentials.
+then RE-RUN this installer once so it pulls py-clob-client, OR run:
+
+    sudo -u polyweat /opt/polyweat/.venv/bin/pip install py-clob-client
 
 Useful commands:
     sudo systemctl enable --now polyweat

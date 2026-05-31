@@ -34,6 +34,10 @@ def pre_trade_checks(td: TradeDecision, db: Database, cfg: Config) -> RiskCheck:
     if td.proposed_size_usd is None or td.proposed_size_usd <= 0:
         return RiskCheck(False, "invalid_size")
 
+    # Always reject duplicates (the cap above doesn't catch a same-market re-entry).
+    if db.has_open_position(td.market_id):
+        return RiskCheck(False, "duplicate_market_position")
+
     # Re-check size cap (defense-in-depth).
     if td.proposed_size_usd > cfg.max_position_per_market_usd:
         return RiskCheck(
@@ -41,11 +45,10 @@ def pre_trade_checks(td: TradeDecision, db: Database, cfg: Config) -> RiskCheck:
             f"size_above_cap_{td.proposed_size_usd}>{cfg.max_position_per_market_usd}",
         )
 
-    # Re-check open position count.
-    if db.has_open_position(td.market_id):
-        return RiskCheck(False, "duplicate_market_position")
-    if db.count_open_positions() >= cfg.max_open_positions:
-        return RiskCheck(False, "max_open_positions_reached")
+    # Re-check open position count INCLUDING in-flight passive orders.
+    in_flight = db.count_open_positions() + db.count_open_passive_orders()
+    if in_flight >= cfg.max_open_positions:
+        return RiskCheck(False, f"max_open_positions_reached_{in_flight}")
 
     # Re-check daily loss cap.
     if db.daily_loss_today() >= cfg.max_daily_loss_usd:

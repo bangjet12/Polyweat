@@ -23,11 +23,26 @@ def _get_str(key: str, default: str = "") -> str:
     return default if val is None or val == "" else val
 
 
+_TRUTHY = {"1", "true", "yes", "on", "y", "t"}
+_FALSY = {"0", "false", "no", "off", "n", "f"}
+
+
 def _get_bool(key: str, default: bool = False) -> bool:
+    """Return True/False/<default>.
+
+    Crucially, a value that is *set but unrecognized* (typo such as
+    ``DRY_RUN=ture``) returns ``default`` so we never silently flip the
+    safe default to live mode. A warning is logged in :func:`load_config`.
+    """
     val = os.environ.get(key)
-    if val is None:
+    if val is None or val.strip() == "":
         return default
-    return val.strip().lower() in {"1", "true", "yes", "on", "y", "t"}
+    v = val.strip().lower()
+    if v in _TRUTHY:
+        return True
+    if v in _FALSY:
+        return False
+    return default  # unrecognized -> keep the SAFE default
 
 
 def _get_float(key: str, default: float) -> float:
@@ -54,6 +69,8 @@ class Config:
     polymarket_api_passphrase: str = ""
     polymarket_private_key: str = ""
     polymarket_proxy_address: str = ""
+    # 1 = direct EOA signer (raw private key); 2 = proxy/Magic.link.
+    polymarket_signature_type: int = 2
 
     # ----- Mode -----
     dry_run: bool = True
@@ -114,6 +131,10 @@ class Config:
     allow_exact_temp_markets: bool = False
     allow_ambiguous_markets: bool = False
 
+    # ----- Reliability -----
+    max_consecutive_scan_failures: int = 5
+    scanned_markets_retention_days: int = 7
+
     # ----- Storage -----
     data_dir: Path = field(default_factory=lambda: Path("./data"))
     log_dir: Path = field(default_factory=lambda: Path("./logs"))
@@ -156,6 +177,7 @@ def load_config(env_file: Optional[str] = None) -> Config:
         polymarket_api_passphrase=_get_str("POLYMARKET_API_PASSPHRASE"),
         polymarket_private_key=_get_str("POLYMARKET_PRIVATE_KEY"),
         polymarket_proxy_address=_get_str("POLYMARKET_PROXY_ADDRESS"),
+        polymarket_signature_type=_get_int("POLYMARKET_SIGNATURE_TYPE", 2),
         dry_run=_get_bool("DRY_RUN", True),
         live_trading=_get_bool("LIVE_TRADING", False),
         weather_provider=_get_str("WEATHER_PROVIDER", "open_meteo"),
@@ -189,6 +211,8 @@ def load_config(env_file: Optional[str] = None) -> Config:
         allow_longshot=_get_bool("ALLOW_LONGSHOT", False),
         allow_exact_temp_markets=_get_bool("ALLOW_EXACT_TEMP_MARKETS", False),
         allow_ambiguous_markets=_get_bool("ALLOW_AMBIGUOUS_MARKETS", False),
+        max_consecutive_scan_failures=_get_int("MAX_CONSECUTIVE_SCAN_FAILURES", 5),
+        scanned_markets_retention_days=_get_int("SCANNED_MARKETS_RETENTION_DAYS", 7),
         data_dir=Path(_get_str("DATA_DIR", "./data")),
         log_dir=Path(_get_str("LOG_DIR", "./logs")),
         db_path=Path(_get_str("DB_PATH", "./data/polyweat.db")),
@@ -202,4 +226,18 @@ def load_config(env_file: Optional[str] = None) -> Config:
         http_timeout_seconds=_get_float("HTTP_TIMEOUT_SECONDS", 15.0),
     )
     cfg.ensure_dirs()
+
+    # Sanity-warn the operator when the live flags are visibly garbled.
+    # We don't raise; we just record the fact, and we keep the safe default.
+    import logging
+    _log = logging.getLogger("polyweat.config")
+    for key, default in (("DRY_RUN", True), ("LIVE_TRADING", False)):
+        raw = os.environ.get(key)
+        if raw is not None and raw.strip() != "" and raw.strip().lower() not in (
+            _TRUTHY | _FALSY
+        ):
+            _log.warning(
+                "Unrecognized boolean for %s=%r; using safe default %s",
+                key, raw, default,
+            )
     return cfg

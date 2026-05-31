@@ -98,6 +98,19 @@ class GammaClient:
         log.info("Gamma: fetched %d active markets", len(markets))
         return markets
 
+    def fetch_market(self, market_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single market by id (works for closed/resolved markets too)."""
+        if not market_id:
+            return None
+        try:
+            return get_json(
+                f"{self.base_url}/markets/{market_id}",
+                timeout=self.timeout,
+            )
+        except Exception as exc:
+            log.warning("fetch_market(%s) failed: %s", market_id, exc)
+            return None
+
     @staticmethod
     def normalize(raw: Dict[str, Any]) -> Dict[str, Any]:
         """Normalize a raw Gamma market dict into the fields we need."""
@@ -139,6 +152,14 @@ class GammaClient:
             else str(raw.get("conditionId") or raw.get("slug") or question)
         )
 
+        # Binary-market sanity check: the bot only trades plain YES/NO
+        # markets. If we couldn't identify both outcome legs we mark the
+        # market as non-binary and the runner skips it explicitly.
+        is_binary = (
+            yes_idx is not None and no_idx is not None
+            and yes_token is not None and no_token is not None
+        )
+
         return {
             "market_id": market_id,
             "condition_id": raw.get("conditionId"),
@@ -157,5 +178,6 @@ class GammaClient:
             "liquidity_usd": _to_float(raw.get("liquidity")) or 0.0,
             "active": bool(raw.get("active", True)),
             "closed": bool(raw.get("closed", False)),
+            "is_binary": is_binary,
             "raw": raw,
         }

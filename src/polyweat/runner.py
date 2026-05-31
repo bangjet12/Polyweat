@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import signal
 import time
-from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,7 +21,7 @@ from polyweat.models import (
 )
 from polyweat.parser.filter import is_weather_temperature_market, parse_market
 from polyweat.strategy.decision import make_decision
-from polyweat.trading.trader import BaseTrader, build_trader
+from polyweat.trading.trader import BaseTrader, build_trader, reconcile_positions
 
 log = get_logger("runner")
 
@@ -40,6 +39,8 @@ class Runner:
         )
         self.trader: BaseTrader = build_trader(self.db, cfg)
         self._stop = False
+        self._consecutive_failures = 0
+        self._last_purge_ts = 0.0
 
         # Per-cycle forecast cache: { (lat,lon, target_day_iso): WeatherForecast }
         self._fc_cache: Dict[Tuple[float, float, str], WeatherForecast] = {}
@@ -84,15 +85,29 @@ class Runner:
     # ------------------------------------------------------------------
 
     def scan_once(self) -> Dict[str, int]:
-        """One full pass: fetch -> filter -> decide -> trade. Return counters."""
+        """One full pass: reconcile -> fetch -> filter -> decide -> trade.
+
+        Returns counters for the cycle. Never raises - exceptions inside
+        any one market processing are logged and the cycle continues.
+        """
         self._fc_cache.clear()
         counters: Dict[str, int] = {
             "fetched": 0, "weather": 0, "parsed_ok": 0,
             "decisions": 0, "entered": 0, "passive": 0,
             "watch": 0, "skip": 0, "rejected_pre_parse": 0,
             "any_resolve_under_6h": 0,
+            "positions_closed": 0,
         }
 
+        # ----- 0. Reconcile resolved positions FIRST so that
+        #          MAX_DAILY_LOSS_USD applies to today's actual losses
+        #          before we emit any new ENTERs this cycle. -----
+        try:
+            counters["positions_closed"] = reconcile_positions(self.db, self.gamma)
+        except Exception as exc:
+            log.exception("position reconciliation failed: %s", exc)
+
+        # ----- 1. Fetch active markets -----
         try:
             raw_markets = self.gamma.fetch_active_markets()
         except Exception as exc:
@@ -100,6 +115,7 @@ class Runner:
             return counters
         counters["fetched"] = len(raw_markets)
 
+        # ----- 2. Filter + parse -----
         candidates: List[ParsedMarket] = []
         for raw in raw_markets:
             try:
@@ -112,22 +128,31 @@ class Runner:
             d = nm.get("description") or ""
             is_weather = is_weather_temperature_market(q, d)
 
-            self.db.insert_scanned_market(
-                market_id=nm["market_id"],
-                title=q,
-                end_time=nm.get("end_time"),
-                yes_price=nm.get("yes_price"),
-                no_price=nm.get("no_price"),
-                liquidity_usd=float(nm.get("liquidity_usd") or 0.0),
-                volume_usd=float(nm.get("volume_usd") or 0.0),
-                is_weather=is_weather,
-                parse_score=0.0,
-                raw={"slug": nm.get("slug"), "outcomes": nm.get("outcomes")},
-            )
-
-            if not is_weather:
+            # Only persist weather markets to keep `scanned_markets` from
+            # growing unbounded with sports/politics noise.
+            if is_weather:
+                self.db.insert_scanned_market(
+                    market_id=nm["market_id"],
+                    title=q,
+                    end_time=nm.get("end_time"),
+                    yes_price=nm.get("yes_price"),
+                    no_price=nm.get("no_price"),
+                    liquidity_usd=float(nm.get("liquidity_usd") or 0.0),
+                    volume_usd=float(nm.get("volume_usd") or 0.0),
+                    is_weather=True,
+                    parse_score=0.0,
+                    raw={"slug": nm.get("slug"), "outcomes": nm.get("outcomes")},
+                )
+            else:
                 continue
             counters["weather"] += 1
+
+            # Skip non-binary markets explicitly.
+            if not nm.get("is_binary"):
+                self.db.insert_rejected(
+                    nm["market_id"], q, "not_binary_yes_no_market",
+                )
+                continue
 
             pm = parse_market(nm, geocoder=self.weather)
             if pm.parse_score >= 0.4:
@@ -141,11 +166,12 @@ class Runner:
                 )
 
         log.info(
-            "scan: fetched=%d weather=%d parsed_ok=%d",
+            "scan: fetched=%d weather=%d parsed_ok=%d closed_today=%d",
             counters["fetched"], counters["weather"], counters["parsed_ok"],
+            counters["positions_closed"],
         )
 
-        # ------- per-candidate decision + execution -------
+        # ----- 3. Per-candidate decision + execution -----
         for pm in candidates:
             hours_to_res = self._hours_until(pm.end_time)
             if hours_to_res is not None and hours_to_res <= self.cfg.best_hours_to_resolution:
@@ -155,8 +181,6 @@ class Runner:
                 td = self._decide_and_trade(pm)
             except Exception as exc:
                 log.exception("decide_and_trade failed for %s: %s", pm.market_id, exc)
-                continue
-            if td is None:
                 continue
             counters["decisions"] += 1
             if td.decision == "ENTER":
@@ -168,11 +192,22 @@ class Runner:
             else:
                 counters["skip"] += 1
 
-        # ------- maintain passive orders -------
+        # ----- 4. Maintain passive orders (cancel expired, recognize fills) -----
         try:
             self.trader.reconcile_passive_orders()
         except Exception as exc:
             log.exception("reconcile_passive_orders failed: %s", exc)
+
+        # ----- 5. Periodic retention (every ~6 hours of wall time) -----
+        now_ts = time.monotonic()
+        if now_ts - self._last_purge_ts > 6 * 3600:
+            try:
+                deleted = self.db.purge_old_rows(self.cfg.scanned_markets_retention_days)
+                if deleted:
+                    log.info("retention: purged %d old rows", deleted)
+            except Exception as exc:
+                log.warning("purge_old_rows failed: %s", exc)
+            self._last_purge_ts = now_ts
 
         return counters
 
@@ -180,7 +215,7 @@ class Runner:
     # Per-market work
     # ------------------------------------------------------------------
 
-    def _decide_and_trade(self, pm: ParsedMarket) -> Optional[TradeDecision]:
+    def _decide_and_trade(self, pm: ParsedMarket) -> TradeDecision:
         # Forecast (cached)
         fc = self._forecast_for(pm)
 
@@ -196,6 +231,7 @@ class Runner:
             pm, fc, book_yes, book_no, self.cfg,
             has_open_position=self.db.has_open_position(pm.market_id),
             open_positions_count=self.db.count_open_positions(),
+            open_passive_count=self.db.count_open_passive_orders(),
             daily_loss_so_far_usd=self.db.daily_loss_today(),
         )
 
@@ -224,11 +260,9 @@ class Runner:
                 reason=td.skip_reason or "near-miss",
             )
         elif td.decision in ("ENTER", "PASSIVE"):
-            # If it was on the watchlist, remove it.
             self.db.remove_from_watchlist(td.market_id)
             self.trader.execute(td)
         elif td.decision == "SKIP":
-            # Drop from watchlist if previously parked there.
             self.db.remove_from_watchlist(td.market_id)
 
         log.info(
@@ -250,16 +284,32 @@ class Runner:
     def run_forever(self) -> None:
         self._install_signal_handlers()
         log.info(
-            "Polyweat starting (DRY_RUN=%s LIVE=%s) ...",
+            "Polyweat starting (mode=%s, dry_run=%s, live_trading=%s) ...",
+            "LIVE" if self.cfg.is_live else "DRY_RUN",
             self.cfg.dry_run, self.cfg.live_trading,
         )
         while not self._stop:
             t0 = time.monotonic()
+            counters: Dict[str, int] = {}
             try:
                 counters = self.scan_once()
+                self._consecutive_failures = 0
             except Exception as exc:
-                log.exception("scan_once crashed: %s", exc)
-                counters = {"any_resolve_under_6h": 0}
+                self._consecutive_failures += 1
+                log.exception(
+                    "scan_once crashed (%d/%d): %s",
+                    self._consecutive_failures,
+                    self.cfg.max_consecutive_scan_failures,
+                    exc,
+                )
+                if self._consecutive_failures >= self.cfg.max_consecutive_scan_failures:
+                    log.error(
+                        "Circuit breaker tripped after %d consecutive failures - "
+                        "exiting so systemd can decide whether to restart.",
+                        self._consecutive_failures,
+                    )
+                    break
+
             elapsed = time.monotonic() - t0
 
             interval = self.cfg.scan_interval_seconds

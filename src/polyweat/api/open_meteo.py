@@ -135,6 +135,11 @@ class OpenMeteoClient:
         if raw is None:
             return None
 
+        # Open-Meteo returns the *resolved* timezone in the response payload.
+        # We must use that one (NOT the request value) to interpret hourly
+        # timestamps - otherwise tz="auto" would silently parse as UTC.
+        resolved_tz = raw.get("timezone") or (tz if tz and tz != "auto" else "UTC")
+
         hourly = raw.get("hourly") or {}
         daily = raw.get("daily") or {}
         h_times = hourly.get("time") or []
@@ -143,13 +148,14 @@ class OpenMeteoClient:
         parsed_times: List[datetime] = []
         parsed_temps: List[float] = []
         for ts, tval in zip(h_times, h_temps):
-            dt = _parse_iso_naive(ts, tz)
+            dt = _parse_iso_naive(ts, resolved_tz)
             tv = _f(tval)
             if dt is not None and tv is not None:
                 parsed_times.append(dt)
                 parsed_temps.append(tv)
 
-        # Daily extremes - prefer the day matching target_date in city TZ.
+        # Daily extremes - prefer the day matching target_date in the
+        # *resolved* TZ.
         d_times = daily.get("time") or []
         d_max = daily.get("temperature_2m_max") or []
         d_min = daily.get("temperature_2m_min") or []
@@ -157,8 +163,8 @@ class OpenMeteoClient:
         if target_date is not None:
             try:
                 local = target_date
-                if ZoneInfo is not None and tz:
-                    local = target_date.astimezone(ZoneInfo(tz))
+                if ZoneInfo is not None and resolved_tz:
+                    local = target_date.astimezone(ZoneInfo(resolved_tz))
                 target_day_str = local.date().isoformat()
             except Exception:
                 target_day_str = None
@@ -193,7 +199,7 @@ class OpenMeteoClient:
             city=city,
             lat=lat,
             lon=lon,
-            tz=tz,
+            tz=resolved_tz,
             fetched_at=datetime.now(timezone.utc),
             hourly_times=parsed_times,
             hourly_temps_c=parsed_temps,

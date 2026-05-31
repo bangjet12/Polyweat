@@ -31,9 +31,11 @@ If any of that fails, it does **not** trade. It either parks the market on a wat
 Risk caps:
 
 - Max position per market: **$1**
-- Max open positions: **5**
-- Max daily realised loss: **$5**
-- No martingale / no averaging-down / no all-in / no chase above 0.985.
+- Max open positions: **5** (counts both filled positions *and* in-flight passive limit orders)
+- Max daily realised loss: **$5** — enforced via position reconciliation: each scan cycle the bot fetches resolved markets from Gamma, computes realised PnL, marks the position closed, and that PnL feeds the daily-loss gate
+- No martingale / no averaging-down / no all-in / no chase above 0.985
+- Range markets ("between 70°F and 80°F") and exact-temperature markets are recognised but **skipped** by default
+- Word-boundary parsing - so "Will the LOW be HIGHER than X°F?" is correctly classified as `lowest_gt`, not `highest_gte`
 
 If the ask sits just above 0.985, the bot can post a **passive limit buy** in the 0.95 – 0.975 band that automatically cancels after `PASSIVE_ORDER_EXPIRE_SECONDS` (default 180s).
 
@@ -45,10 +47,10 @@ So 2 °C of forecast cushion ≈ 93%, 3 °C ≈ 97.5%, 5 °C ≈ 99.7% (capped a
 
 The bot **never** uses Claude / OpenAI / any LLM, never uses any paid AI. Only:
 
-- Polymarket Gamma API (markets metadata)
+- Polymarket Gamma API (markets metadata + closed-market resolution)
 - Polymarket CLOB API (orderbook + live orders)
 - Open-Meteo (free, keyless forecast + geocoding)
-- SQLite (local storage)
+- SQLite (local storage; WAL mode, UTC daily key, 7-day rolling retention)
 
 ---
 
@@ -150,13 +152,17 @@ Install the optional live dependency:
 pip install py-clob-client
 ```
 
+(or use the `[live]` extra: `pip install -e .[live]`. The provided `deploy/install.sh` will install it automatically when it sees `LIVE_TRADING=true` in `.env`.)
+
 Then start as usual:
 
 ```bash
 polyweat run
 ```
 
-The bot logs a loud warning on startup when it is actually live. If `py-clob-client` is missing or any credential is empty, it refuses to start (it will not silently fall back to dry-run).
+The bot logs a loud warning on startup when it is actually live. If `py-clob-client` is missing, any required credential is empty, or `POLYMARKET_SIGNATURE_TYPE=2` is set without a `POLYMARKET_PROXY_ADDRESS`, it refuses to start (it will not silently fall back to dry-run).
+
+> Crash-safe live ordering: each live order writes a `pending` row to local SQLite *before* hitting Polymarket. If the process dies between submission and the follow-up update, you will still have a breadcrumb that prevents double-entry.
 
 > Start with the smallest possible capital. The defaults (`$1` per market, `$5` daily loss cap) are intentionally tiny.
 

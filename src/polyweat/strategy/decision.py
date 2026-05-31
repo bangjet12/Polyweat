@@ -26,6 +26,12 @@ from polyweat.strategy.predictor import Prediction, predict
 log = get_logger("decision")
 
 
+# 1 °C = 1.8 °F. Used to gate distance in both units when the market is
+# stated in F.
+_C_PER_F = 5.0 / 9.0
+_F_PER_C = 9.0 / 5.0
+
+
 def _hours_until(end: Optional[datetime]) -> Optional[float]:
     if end is None:
         return None
@@ -45,8 +51,13 @@ def make_decision(
     has_open_position: bool,
     open_positions_count: int,
     daily_loss_so_far_usd: float,
+    open_passive_count: int = 0,
 ) -> TradeDecision:
-    """Return a TradeDecision for one market."""
+    """Return a TradeDecision for one market.
+
+    ``open_passive_count`` is included so that a stack of passive limit
+    orders can't sneak past the MAX_OPEN_POSITIONS cap if they all fill.
+    """
     now = datetime.now(timezone.utc)
     hours_to_res = _hours_until(pm.end_time)
 
@@ -78,6 +89,11 @@ def make_decision(
     # ---------- hard gates: parsing ----------
     if pm.market_kind == "unknown":
         base.skip_reason = "market_kind_unknown"
+        return base
+    if pm.market_kind == "range":
+        # Range markets are recognised but always SKIPPED - they have two
+        # bounds and our predictor only knows how to compare against one.
+        base.skip_reason = "range_market_skipped"
         return base
     if pm.market_kind == "exact_temp" and not cfg.allow_exact_temp_markets:
         base.skip_reason = "exact_temp_disabled"
@@ -122,14 +138,21 @@ def make_decision(
     base.temp_distance_c = pred.temp_distance_c
     base.bot_probability = pred.bot_probability
 
-    # Distance gate - forecast must be FAR from threshold.
+    # ---------- distance gate (BOTH units when applicable) ----------
     if pred.temp_distance_c is None or pred.temp_distance_c < cfg.min_temp_distance_c:
         base.skip_reason = (
-            f"forecast_too_close_to_threshold_{pred.temp_distance_c}"
+            f"forecast_too_close_to_threshold_C_{pred.temp_distance_c}"
         )
         return base
 
-    # Probability gate.
+    distance_f = pred.temp_distance_c * _F_PER_C
+    if pm.unit == "F" and distance_f < cfg.min_temp_distance_f:
+        base.skip_reason = (
+            f"forecast_too_close_to_threshold_F_{distance_f:.2f}"
+        )
+        return base
+
+    # ---------- probability gate ----------
     if pred.bot_probability is None or pred.bot_probability < cfg.min_bot_probability:
         base.skip_reason = f"low_bot_probability_{pred.bot_probability}"
         return base
@@ -152,6 +175,9 @@ def make_decision(
     token_id = pm.yes_token_id if base.outcome == "YES" else pm.no_token_id
     base.token_id = token_id
 
+    if not token_id:
+        base.skip_reason = "no_token_id_for_outcome"
+        return base
     if book is None or book.best_ask is None:
         base.skip_reason = "no_orderbook"
         return base
@@ -172,8 +198,14 @@ def make_decision(
     if has_open_position:
         base.skip_reason = "already_have_position_in_market"
         return base
-    if open_positions_count >= cfg.max_open_positions:
-        base.skip_reason = f"max_open_positions_reached_{open_positions_count}"
+
+    # Count both filled positions AND in-flight passive orders against the
+    # cap, because a passive can fill any time and become a position.
+    in_flight = open_positions_count + open_passive_count
+    if in_flight >= cfg.max_open_positions:
+        base.skip_reason = (
+            f"max_open_positions_reached_{open_positions_count}+passive{open_passive_count}"
+        )
         return base
     if daily_loss_so_far_usd >= cfg.max_daily_loss_usd:
         base.skip_reason = f"daily_loss_limit_hit_{daily_loss_so_far_usd:.2f}"
@@ -183,25 +215,26 @@ def make_decision(
     ask = float(book.best_ask)
 
     # Below MIN_ENTRY_PRICE means the market disagrees with us strongly -
-    # this would be a long-shot bet; default-disabled.
+    # this is a long-shot bet; default-disabled.
     if ask < cfg.min_entry_price:
         if cfg.allow_longshot:
-            base.decision = "WATCH"
-            base.skip_reason = "longshot_disabled_by_default"
+            # Operator opted in: enter (still capped by all earlier gates).
+            base.decision = "ENTER"
+            base.proposed_price = ask
+            base.proposed_size_usd = cfg.max_position_per_market_usd
             return base
         base.skip_reason = f"price_below_min_entry_{ask:.4f}"
         return base
 
     if ask <= cfg.max_entry_price:
         # Direct ENTER - place a marketable buy at the ask.
-        size = min(cfg.max_position_per_market_usd, cfg.max_position_per_market_usd)
         base.decision = "ENTER"
         base.proposed_price = ask
-        base.proposed_size_usd = size
+        base.proposed_size_usd = cfg.max_position_per_market_usd
         return base
 
-    # Ask too high (> max_entry_price). If passive limits allowed and we're
-    # within reach, queue a passive limit instead.
+    # Ask too high (> max_entry_price). If passive limits allowed and the
+    # ask is within reach of the passive band, queue a passive limit instead.
     if cfg.allow_passive_limit_orders and (ask - cfg.passive_order_max_price) <= 0.03:
         # Place passive limit at the lower end of the passive band.
         passive_price = round(min(
@@ -213,7 +246,7 @@ def make_decision(
         base.proposed_size_usd = cfg.max_position_per_market_usd
         return base
 
-    # Otherwise watch it for next scan.
+    # Otherwise watch it for the next scan.
     base.decision = "WATCH"
     base.skip_reason = f"price_above_max_entry_{ask:.4f}"
     return base

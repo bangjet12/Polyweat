@@ -8,6 +8,7 @@ Type=simple
 User=polyweat
 Group=polyweat
 WorkingDirectory=/opt/polyweat
+Environment=TZ=UTC
 EnvironmentFile=-/opt/polyweat/.env
 ExecStart=/opt/polyweat/.venv/bin/polyweat --env /opt/polyweat/.env run
 Restart=on-failure

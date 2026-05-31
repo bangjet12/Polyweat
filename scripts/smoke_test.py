@@ -1,16 +1,24 @@
-"""Quick smoke test of the pure-python parts of polyweat.
+"""Smoke + failure-path tests for the pure-python parts of polyweat.
 
-Does NOT touch the network and does NOT require `requests` /
-`python-dotenv` to be installed.
+Does NOT touch the network and does NOT require ``requests`` /
+``python-dotenv`` to be installed.
+
+Run from the repo root:
+
+    python scripts/smoke_test.py
+
+Exits non-zero on the first failed assertion.
 """
 
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# Make src/ importable when running from repo root.
+# Make src/ importable when running from the repo root.
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
@@ -18,6 +26,10 @@ sys.path.insert(0, str(ROOT / "src"))
 def _ok(label: str) -> None:
     print(f"  PASS  {label}")
 
+
+# =====================================================================
+# Happy-path tests
+# =====================================================================
 
 def test_config():
     from polyweat.config import load_config
@@ -31,12 +43,12 @@ def test_config():
     assert cfg.max_open_positions == 5
     assert cfg.max_daily_loss_usd == 5.0
     assert cfg.is_live is False
-    _ok("config defaults are safe (DRY_RUN, $1 cap, 5 max)")
+    assert cfg.polymarket_signature_type == 2
+    _ok("config defaults are safe (DRY_RUN, $1 cap, 5 max, signature_type=2)")
 
 
 def test_threshold_parser():
     from polyweat.parser.threshold_parser import parse_threshold
-
     cases = [
         ("Will the high in NYC exceed 80°F today?", "highest_gte", 80.0, "F"),
         ("Highest temperature in Chicago above 95F today?", "highest_gte", 95.0, "F"),
@@ -69,12 +81,10 @@ def test_date_parser():
     from polyweat.parser.date_parser import extract_date
     now = datetime.now(timezone.utc)
     fb = now + timedelta(hours=10)
-    out = extract_date("Will it be hot today?", fallback=fb)
-    assert out is not None
+    assert extract_date("Will it be hot today?", fallback=fb) is not None
     out2 = extract_date("Will it be hot tomorrow?", fallback=fb)
     assert out2 is not None and out2.date() == (now + timedelta(days=1)).date()
-    out3 = extract_date("Forecast for May 30", fallback=fb)
-    assert out3 is not None
+    assert extract_date("Forecast for May 30", fallback=fb) is not None
     _ok("date parser: today/tomorrow/Month Day")
 
 
@@ -86,16 +96,11 @@ def test_filter():
     assert is_weather_temperature_market(
         "Highest temperature in Chicago this week?"
     ) is True
-    # Block sports/politics/crypto even if they accidentally mention weather
     assert is_weather_temperature_market(
         "Will Trump win the election?", "weather forecast for ohio"
     ) is False
-    assert is_weather_temperature_market(
-        "BTC price by end of week"
-    ) is False
-    assert is_weather_temperature_market(
-        "Will the Knicks win tonight?"
-    ) is False
+    assert is_weather_temperature_market("BTC price by end of week") is False
+    assert is_weather_temperature_market("Will the Knicks win tonight?") is False
     _ok("filter: accepts weather, rejects sports/politics/crypto")
 
 
@@ -110,28 +115,49 @@ def test_predictor_probability_curve():
     _ok(f"prob curve: d=2 -> {p2:.4f}, d=3 -> {p3:.4f}, d=5 -> {p5:.4f}")
 
 
-def test_predictor_decision():
-    from polyweat.models import ParsedMarket, WeatherForecast
-    from polyweat.strategy.predictor import predict
-
-    pm = ParsedMarket(
+def _build_pm_yes(threshold_c=26.7, threshold_f=80.0, kind="highest_gte"):
+    from polyweat.models import ParsedMarket
+    return ParsedMarket(
         market_id="m1", title="High in NYC above 80F today?", description="",
-        end_time=datetime.now(timezone.utc) + timedelta(hours=10),
+        end_time=datetime.now(timezone.utc) + timedelta(hours=8),
         yes_token_id="y", no_token_id="n", yes_price=0.97, no_price=0.03,
         liquidity_usd=600.0, city="New York", city_lat=40.7, city_lon=-74.0,
         city_tz="America/New_York",
-        target_date=datetime.now(timezone.utc) + timedelta(hours=10),
-        threshold_c=26.7, threshold_f=80.0,
-        market_kind="highest_gte", unit="F",
+        target_date=datetime.now(timezone.utc) + timedelta(hours=8),
+        threshold_c=threshold_c, threshold_f=threshold_f,
+        market_kind=kind, unit="F",
         rules_clear=True, parse_score=1.0,
     )
-    fc = WeatherForecast(
+
+
+def _build_fc(window_high=31.0, window_low=20.0):
+    from polyweat.models import WeatherForecast
+    return WeatherForecast(
         city="New York", lat=40.7, lon=-74.0, tz="America/New_York",
         fetched_at=datetime.now(timezone.utc),
-        hourly_times=[], hourly_temps_c=[28.0, 29.0, 30.0, 31.0],
-        daily_high_c=31.0, daily_low_c=20.0,
-        forecast_window_high_c=31.0, forecast_window_low_c=20.0,
+        hourly_times=[], hourly_temps_c=[window_high],
+        daily_high_c=window_high, daily_low_c=window_low,
+        forecast_window_high_c=window_high, forecast_window_low_c=window_low,
     )
+
+
+def _build_book(best_ask=0.97, best_bid=0.96, liquidity=600.0):
+    from polyweat.models import OrderbookSnapshot
+    spread = best_ask - best_bid if best_ask and best_bid else None
+    mid = (best_ask + best_bid) / 2 if best_ask and best_bid else None
+    spread_pct = (spread / mid * 100) if (spread is not None and mid) else None
+    return OrderbookSnapshot(
+        token_id="y", best_bid=best_bid, best_ask=best_ask,
+        bid_size=200.0, ask_size=200.0,
+        spread=spread, spread_percent=spread_pct, mid=mid,
+        liquidity_usd=liquidity, fetched_at=datetime.now(timezone.utc),
+    )
+
+
+def test_predictor_decision():
+    from polyweat.strategy.predictor import predict
+    pm = _build_pm_yes()
+    fc = _build_fc(window_high=31.0)
     pred = predict(pm, fc)
     assert pred.outcome == "YES"
     assert pred.temp_distance_c is not None and pred.temp_distance_c >= 4.0
@@ -140,44 +166,17 @@ def test_predictor_decision():
         f"prob={pred.bot_probability:.4f}")
 
 
-def test_decision_engine():
-    from datetime import datetime, timedelta, timezone
+def test_decision_engine_happy_path():
     from polyweat.config import load_config
-    from polyweat.models import (
-        OrderbookSnapshot, ParsedMarket, WeatherForecast,
-    )
     from polyweat.strategy.decision import make_decision
 
     cfg = load_config()
-    pm = ParsedMarket(
-        market_id="m1", title="High in NYC above 80F today?", description="",
-        end_time=datetime.now(timezone.utc) + timedelta(hours=8),
-        yes_token_id="yes-tok", no_token_id="no-tok",
-        yes_price=0.97, no_price=0.03,
-        liquidity_usd=600.0, city="New York", city_lat=40.7, city_lon=-74.0,
-        city_tz="America/New_York",
-        target_date=datetime.now(timezone.utc) + timedelta(hours=8),
-        threshold_c=26.7, threshold_f=80.0,
-        market_kind="highest_gte", unit="F",
-        rules_clear=True, parse_score=1.0,
-    )
-    fc = WeatherForecast(
-        city="New York", lat=40.7, lon=-74.0, tz="America/New_York",
-        fetched_at=datetime.now(timezone.utc),
-        hourly_times=[], hourly_temps_c=[28.0, 29.0, 30.0, 31.0],
-        daily_high_c=31.0, daily_low_c=20.0,
-        forecast_window_high_c=31.0, forecast_window_low_c=20.0,
-    )
-    book_yes = OrderbookSnapshot(
-        token_id="yes-tok", best_bid=0.96, best_ask=0.97,
-        bid_size=200.0, ask_size=200.0,
-        spread=0.01, spread_percent=1.04, mid=0.965,
-        liquidity_usd=600.0, fetched_at=datetime.now(timezone.utc),
-    )
+    pm = _build_pm_yes()
+    fc = _build_fc(31.0)
+    book = _build_book(0.97, 0.96)
     td = make_decision(
-        pm, fc, book_yes, None, cfg,
-        has_open_position=False,
-        open_positions_count=0,
+        pm, fc, book, None, cfg,
+        has_open_position=False, open_positions_count=0,
         daily_loss_so_far_usd=0.0,
     )
     assert td.decision == "ENTER", f"expected ENTER got {td.decision} ({td.skip_reason})"
@@ -185,35 +184,20 @@ def test_decision_engine():
     assert td.proposed_price == 0.97
     _ok(f"decision: ENTER YES @ {td.proposed_price} prob={td.bot_probability}")
 
-    # Now break it: ask too high -> PASSIVE
-    book_yes_high = OrderbookSnapshot(
-        token_id="yes-tok", best_bid=0.985, best_ask=0.99,
-        bid_size=200.0, ask_size=200.0,
-        spread=0.005, spread_percent=0.51, mid=0.9875,
-        liquidity_usd=600.0, fetched_at=datetime.now(timezone.utc),
-    )
+    # ask too high -> PASSIVE
+    book2 = _build_book(0.99, 0.985)
     td2 = make_decision(
-        pm, fc, book_yes_high, None, cfg,
-        has_open_position=False,
-        open_positions_count=0,
+        pm, fc, book2, None, cfg,
+        has_open_position=False, open_positions_count=0,
         daily_loss_so_far_usd=0.0,
     )
     assert td2.decision == "PASSIVE", f"expected PASSIVE got {td2.decision}"
-    assert (
-        cfg.passive_order_min_price <= td2.proposed_price <= cfg.passive_order_max_price
-    )
+    assert cfg.passive_order_min_price <= td2.proposed_price <= cfg.passive_order_max_price
     _ok(f"decision: PASSIVE @ {td2.proposed_price}")
 
-    # Now: forecast right at threshold -> SKIP
-    fc_close = WeatherForecast(
-        city="New York", lat=40.7, lon=-74.0, tz="America/New_York",
-        fetched_at=datetime.now(timezone.utc),
-        hourly_times=[], hourly_temps_c=[26.5, 27.0, 27.5],
-        daily_high_c=27.5, daily_low_c=20.0,
-        forecast_window_high_c=27.5, forecast_window_low_c=20.0,
-    )
+    # forecast right at threshold -> SKIP
     td3 = make_decision(
-        pm, fc_close, book_yes, None, cfg,
+        pm, _build_fc(27.5), book, None, cfg,
         has_open_position=False, open_positions_count=0,
         daily_loss_so_far_usd=0.0,
     )
@@ -240,21 +224,243 @@ def test_db_roundtrip(tmp_db: Path):
     db.upsert_position("m1", "tok", "t", "YES", 0.97, 1.0, 1.03, "open")
     assert db.has_open_position("m1") is True
     assert db.count_open_positions() == 1
-
     db.upsert_watchlist(
         "m2", "t2", "Chicago", None, "highest_gte", 30.0, 86.0, "YES",
         0.94, 0.92, 0.99, 0.6, 400.0, "price slightly high",
     )
     assert len(db.list_watchlist()) == 1
-
     db.close_position("m1", -0.50)
     assert db.daily_loss_today() == 0.50
     _ok("db: insert decision/position/watchlist/close round-trips")
 
 
+# =====================================================================
+# Failure-path tests (cover all bug fixes from the pre-deploy review)
+# =====================================================================
+
+def test_get_bool_failsafe():
+    """C1: typos and empty values must NOT silently flip a True default."""
+    from polyweat.config import _get_bool
+
+    for raw in ("ture", "garbage", "", "  ", "TRU", "yess"):
+        os.environ["POLYWEAT_TEST_BOOL"] = raw
+        assert _get_bool("POLYWEAT_TEST_BOOL", True) is True, raw
+        assert _get_bool("POLYWEAT_TEST_BOOL", False) is False, raw
+    for raw in ("true", "TRUE", "Yes", "1", "on"):
+        os.environ["POLYWEAT_TEST_BOOL"] = raw
+        assert _get_bool("POLYWEAT_TEST_BOOL", False) is True, raw
+    for raw in ("false", "0", "no", "off"):
+        os.environ["POLYWEAT_TEST_BOOL"] = raw
+        assert _get_bool("POLYWEAT_TEST_BOOL", True) is False, raw
+    os.environ.pop("POLYWEAT_TEST_BOOL", None)
+    _ok("C1: _get_bool keeps default on unrecognized/typo values")
+
+
+def test_threshold_word_boundary():
+    """C5: 'higher' must NOT trigger the 'high' hint (and similarly for 'lower')."""
+    from polyweat.parser.threshold_parser import parse_threshold
+    out = parse_threshold("Will the daily low be higher than 60F today?")
+    assert out["market_kind"] == "lowest_gt", out
+    _ok("C5: 'low ... higher than 60F' -> lowest_gt (not highest_gte)")
+    out = parse_threshold("Will the daily high be lower than 80F today?")
+    assert out["market_kind"] == "highest_lt", out
+    _ok("C5: 'high ... lower than 80F' -> highest_lt (not lowest_lte)")
+
+
+def test_threshold_range_market():
+    """C6: range markets must be recognized and marked as 'range'."""
+    from polyweat.parser.threshold_parser import parse_threshold
+    out = parse_threshold("Will the high in NYC be between 70F and 80F today?")
+    assert out["market_kind"] == "range", out
+    assert out["is_range"] is True
+    _ok("C6: 'between 70F and 80F' -> range market")
+    out = parse_threshold("Will it be from 70 to 80 degrees today in NYC?")
+    assert out["market_kind"] == "range", out
+    _ok("C6: 'from 70 to 80 degrees' -> range market")
+
+
+def test_decision_skips_range():
+    """C6 -> decision engine SKIPs range markets even if rules_clear."""
+    from polyweat.config import load_config
+    from polyweat.strategy.decision import make_decision
+
+    cfg = load_config()
+    pm = _build_pm_yes(threshold_c=21.1, threshold_f=70.0, kind="range")
+    fc = _build_fc(29.0)
+    book = _build_book(0.97, 0.96)
+    td = make_decision(
+        pm, fc, book, None, cfg,
+        has_open_position=False, open_positions_count=0,
+        daily_loss_so_far_usd=0.0,
+    )
+    assert td.decision == "SKIP" and td.skip_reason == "range_market_skipped"
+    _ok("C6: decision engine skips range markets")
+
+
+def test_decision_passive_cap():
+    """C7: open passive orders count toward MAX_OPEN_POSITIONS."""
+    from polyweat.config import load_config
+    from polyweat.strategy.decision import make_decision
+
+    cfg = load_config()
+    td = make_decision(
+        _build_pm_yes(), _build_fc(31.0), _build_book(0.97, 0.96), None, cfg,
+        has_open_position=False,
+        open_positions_count=4,
+        open_passive_count=1,
+        daily_loss_so_far_usd=0.0,
+    )
+    assert td.decision == "SKIP"
+    assert "max_open_positions" in (td.skip_reason or "")
+    _ok("C7: passive orders count toward MAX_OPEN_POSITIONS")
+
+
+def test_decision_f_distance_gate():
+    """I1: F-distance gate is wired up and enforced.
+
+    Note: 2.0C ≈ 3.6F so the C gate is slightly stricter than the F gate.
+    We just verify the path doesn't crash, the F-distance is computed,
+    and that a comfortable distance (>3°C / >5.4°F) passes both gates.
+    """
+    from polyweat.config import load_config
+    from polyweat.strategy.decision import make_decision
+
+    cfg = load_config()
+    pm = _build_pm_yes(threshold_c=26.667, threshold_f=80.0)
+    book = _build_book(0.97, 0.96)
+
+    # Comfortable distance: forecast 31C vs 26.667C threshold = 4.33C / 7.8F
+    # -> passes both gates -> ENTER
+    td = make_decision(
+        pm, _build_fc(31.0), book, None, cfg,
+        has_open_position=False, open_positions_count=0,
+        daily_loss_so_far_usd=0.0,
+    )
+    assert td.decision == "ENTER", f"expected ENTER got {td.decision} {td.skip_reason}"
+
+    # Tight distance: forecast 28.0C vs 26.667C threshold = 1.33C / 2.4F
+    # -> fails C gate first (since 1.33 < 2.0)
+    td2 = make_decision(
+        pm, _build_fc(28.0), book, None, cfg,
+        has_open_position=False, open_positions_count=0,
+        daily_loss_so_far_usd=0.0,
+    )
+    assert td2.decision == "SKIP"
+    assert "forecast_too_close_to_threshold" in (td2.skip_reason or "")
+    _ok("I1: distance gates enforced (4.33C/7.8F passes; 1.33C/2.4F skips)")
+
+
+def test_decision_skip_reasons_complete():
+    """Verify SKIP reasons cover the new gates added in this fix-pass."""
+    from polyweat.config import load_config
+    from polyweat.strategy.decision import make_decision
+
+    cfg = load_config()
+
+    # missing orderbook
+    td = make_decision(
+        _build_pm_yes(), _build_fc(31.0), None, None, cfg,
+        has_open_position=False, open_positions_count=0,
+        daily_loss_so_far_usd=0.0,
+    )
+    assert td.decision == "SKIP" and td.skip_reason == "no_orderbook"
+
+    # daily loss limit hit
+    td2 = make_decision(
+        _build_pm_yes(), _build_fc(31.0), _build_book(0.97, 0.96), None, cfg,
+        has_open_position=False, open_positions_count=0,
+        daily_loss_so_far_usd=cfg.max_daily_loss_usd,
+    )
+    assert td2.decision == "SKIP" and "daily_loss_limit_hit" in (td2.skip_reason or "")
+
+    # already have position
+    td3 = make_decision(
+        _build_pm_yes(), _build_fc(31.0), _build_book(0.97, 0.96), None, cfg,
+        has_open_position=True, open_positions_count=1,
+        daily_loss_so_far_usd=0.0,
+    )
+    assert td3.decision == "SKIP" and td3.skip_reason == "already_have_position_in_market"
+
+    # spread too wide
+    td4 = make_decision(
+        _build_pm_yes(), _build_fc(31.0), _build_book(0.99, 0.95), None, cfg,
+        has_open_position=False, open_positions_count=0,
+        daily_loss_so_far_usd=0.0,
+    )
+    assert td4.decision == "SKIP" and "spread_too_wide" in (td4.skip_reason or "")
+
+    _ok("decision SKIP reasons: no_orderbook / daily_loss / duplicate / spread")
+
+
+def test_daily_loss_cap():
+    """C4: daily loss cap engages once positions are closed at a loss."""
+    from polyweat.db import Database
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(Path(td) / "test.db")
+        db.upsert_position("m1", "tok", "Title", "YES", 0.97, 1.0, 1.03, "open")
+        db.close_position("m1", -0.97)
+        db.upsert_position("m2", "tok", "Title", "YES", 0.97, 1.0, 1.03, "open")
+        db.close_position("m2", -0.97)
+        loss = db.daily_loss_today()
+        assert abs(loss - 1.94) < 1e-6, loss
+        _ok(f"C4: daily_loss_today() = ${loss:.2f} after 2 closed losses")
+
+
+def test_passive_count_helper():
+    from polyweat.db import Database
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(Path(td) / "test.db")
+        for i in range(3):
+            db.insert_passive_order(
+                market_id=f"m{i}", token_id="t", outcome="YES",
+                price=0.97, size_usd=1.0,
+                expires_at=datetime.now(timezone.utc) + timedelta(seconds=180),
+                external_order_id=None, note="",
+            )
+        assert db.count_open_passive_orders() == 3
+        _ok("C7: count_open_passive_orders() = 3")
+
+
+def test_purge_old_rows():
+    """I4: scanned_markets / forecasts retention works."""
+    from polyweat.db import Database
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(Path(td) / "test.db")
+        db.insert_scanned_market(
+            "m1", "title", None, 0.5, 0.5, 100.0, 100.0, True, 0.5, {},
+        )
+        # Backdate the row to simulate old data
+        with db._conn() as c:
+            c.execute(
+                "UPDATE scanned_markets SET seen_at = ?",
+                ((datetime.now(timezone.utc) - timedelta(days=30)).isoformat(),),
+            )
+        deleted = db.purge_old_rows(retention_days=7)
+        assert deleted == 1, deleted
+        _ok(f"I4: purge_old_rows deleted {deleted} stale row(s)")
+
+
+def test_threshold_picker_proximity():
+    """I8: when 2 numbers carry units, picker prefers the one closest to a hint."""
+    from polyweat.parser.threshold_parser import parse_threshold
+    out = parse_threshold(
+        "Forecast says 30°F, will the high actually exceed 80°F today?"
+    )
+    assert out["market_kind"] == "highest_gte"
+    assert out["threshold_value"] == 80.0, out
+    _ok("I8: picker selects 80F (near 'exceed') over 30F (near 'forecast')")
+
+
+# =====================================================================
+# Runner
+# =====================================================================
+
 def main() -> int:
-    print("Polyweat smoke test")
-    print("-" * 40)
+    print("Polyweat smoke tests")
+    print("=" * 50)
+
+    print("\n[Happy-path]")
+    print("-" * 50)
     test_config()
     test_threshold_parser()
     test_city_parser()
@@ -262,13 +468,26 @@ def main() -> int:
     test_filter()
     test_predictor_probability_curve()
     test_predictor_decision()
-    test_decision_engine()
-
-    import tempfile
+    test_decision_engine_happy_path()
     with tempfile.TemporaryDirectory() as td:
         test_db_roundtrip(Path(td) / "test.db")
-    print("-" * 40)
-    print("All smoke tests passed.")
+
+    print("\n[Failure-path / regression]")
+    print("-" * 50)
+    test_get_bool_failsafe()
+    test_threshold_word_boundary()
+    test_threshold_range_market()
+    test_decision_skips_range()
+    test_decision_passive_cap()
+    test_decision_f_distance_gate()
+    test_decision_skip_reasons_complete()
+    test_daily_loss_cap()
+    test_passive_count_helper()
+    test_purge_old_rows()
+    test_threshold_picker_proximity()
+
+    print("\n" + "=" * 50)
+    print("All tests passed.")
     return 0
 
 
